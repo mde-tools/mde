@@ -1,0 +1,1827 @@
+﻿// BlockStyles.cs
+//
+// mde (Markdown インラインエディタ) の一部。
+// 見出し・コードブロックの見た目（フォントサイズ・余白・枠線など）を適用する静的ヘルパー。
+// Markdown解析（MarkdownConverter）と、右クリックでの段落種別変更（HeadingCodeBlockEditor）の
+// 両方から共有で使われるため、状態を持たない静的メソッドとして独立させている。
+
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Documents;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+
+namespace mde.common
+{
+    /// <summary>見出し・コードブロックの段落スタイルを適用する静的ヘルパー群。</summary>
+    public static class BlockStyles
+    {
+        /// <summary>
+        /// リンクの文字が URL の時に、「/」の後ろに入れる見えない文字（U+034F COMBINING GRAPHEME JOINER）。WPF は URL を「/」の
+        /// 後ろで折り返すが、mdew・mdee（Chromium）は「/」の後ろでは折り返さず、列や本文の端の文字で折り返す。この文字を
+        /// 「/」の後ろに入れると、WPF も「/」の後ろで折り返さなくなり、mdew・mdee と同じ位置で折り返す（実機で確かめた）。
+        /// 結合文字のため、キャレットが止まる位置は増えない（U+2060 WORD JOINER・U+200D ZWJ は、矢印キーで止まる位置が増えるため
+        /// 使わない）。表示のためだけのもので、保存（MarkdownConverter）・コピー（MainWindow.EditorHandleCopying）・検索
+        /// （SearchReplaceService）の時は取り除く。
+        /// </summary>
+        public const char URL_BREAK_JOINER = '\u034F';
+
+        /// <summary>URL とみなす文字（「https://」等で始まるか「www.」で始まり、空白を含まない）。</summary>
+        private static readonly Regex s_urlTextRegex = new Regex("^(?:[A-Za-z][A-Za-z0-9+.-]*://|www\\.)\\S+$", RegexOptions.Compiled);
+
+        /// <summary>リンクの文字が URL なら、「/」の後ろに URL_BREAK_JOINER を入れる（既に入っていれば入れない）。</summary>
+        /// <param name="a_text">リンクの文字。</param>
+        /// <returns>表示に使う文字。URL でなければそのまま。</returns>
+        public static string AddUrlBreakJoiners(string a_text)
+        {
+            if (string.IsNullOrEmpty(a_text) || !s_urlTextRegex.IsMatch(StripUrlBreakJoiners(a_text)))
+            {
+                return a_text;
+            }
+            var sb = new StringBuilder(a_text.Length + 16);
+            for (int i = 0; i < a_text.Length; i++)
+            {
+                sb.Append(a_text[i]);
+                if ('/' == a_text[i] && i + 1 < a_text.Length && URL_BREAK_JOINER != a_text[i + 1])
+                {
+                    sb.Append(URL_BREAK_JOINER);
+                }
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>URL_BREAK_JOINER を取り除く（保存・コピー・検索用）。</summary>
+        /// <param name="a_text">対象の文字。</param>
+        /// <returns>取り除いた文字。</returns>
+        public static string StripUrlBreakJoiners(string a_text)
+        {
+            return null != a_text && 0 <= a_text.IndexOf(URL_BREAK_JOINER) ? a_text.Replace(URL_BREAK_JOINER.ToString(), "") : a_text;
+        }
+
+        /// <summary>本文の文字を書く幅の上限（px。メニュー「表示」→「本文の幅」→「読みやすい幅にする」の時。mdew・mdee と
+        /// 同じ 884px。MainWindow.ApplyDocumentWidth）。</summary>
+        public const double READABLE_DOCUMENT_WIDTH_PX = 884;
+
+        private static readonly Brush m_cellBorder = new SolidColorBrush(Color.FromRgb(0xB4, 0xB4, 0xB4));
+        // コードブロック・インラインコードの背景色と、コードブロックの枠線の色（mdew と同じ）。
+        private static readonly Brush m_codeBlockBackground = new SolidColorBrush(Color.FromRgb(0xF3, 0xF4, 0xF4));
+        private static readonly Brush m_codeBlockBorder = new SolidColorBrush(Color.FromRgb(0xE7, 0xEA, 0xED));
+        // インラインコードの背景色。mdew は枠線で囲んで区別するが、WPF の Run には枠線を付けられないため、
+        // 本文と見分けやすいよう、mde の元の色（暖色系のベージュ）のままにする。
+        private static readonly Brush m_inlineCodeBackground = new SolidColorBrush(Color.FromRgb(0xEC, 0xE8, 0xDC));
+        // ヘッダー行のセル間縦罫線（右辺）だけこの太さにする。本文行の1pxのままだと、印刷
+        // （PDF出力）時にヘッダー行の縦罫線だけラスタライズされず消えることがあるため
+        // （色を変える対策は効果なし、太さを変える対策のみ有効と確認済み）。
+        private const double HEADER_VERTICAL_BORDER_THICKNESS = 1.75;
+        // ハイライト（==text==）の背景色。
+        private static readonly Brush m_highlightBackground = new SolidColorBrush(Color.FromRgb(0xFF, 0xF3, 0x8A));
+        // GitHubスタイルの引用（&gt; ）は背景を付けず、左の縦線と文字色で本文と区別する。
+        private static readonly Brush m_quoteBackground = Brushes.Transparent;
+        // 引用の文字色（本文より少し薄いグレー。引用らしい「落ち着いた」印象にするため）。
+        private static readonly Brush m_quoteForeground = new SolidColorBrush(Color.FromRgb(0x59, 0x59, 0x59));
+
+        // ======================================================================
+        //  表示スタイル（メニュー「表示」→「表示スタイル」。GitHubスタイル／VSCodeスタイル）
+        // ======================================================================
+
+        /// <summary>true＝VSCodeスタイル（Visual Studio Code のプレビューに似せた見た目）、
+        /// false（既定）＝GitHubスタイル（今までの見た目）。MainWindow が起動時と切り替え時に設定する。
+        /// 見た目は段落・Run を作る時に決まるため、切り替えた時は MainWindow が文書全体を作り直す
+        /// （表示フォントの切り替えと同じ方法）。VSCodeスタイルの値は mdew の VSCodeスタイルと同じ。</summary>
+        public static bool VsCodeStyleFlg { get; set; } = false;
+
+        // VSCodeスタイルの色。半透明の色は白地に重ねた時の色にしてある。
+        // 大見出し・中見出しの下線・水平線・表の行の間の線（淡い灰色）。
+        private static readonly Brush m_vsCodeSeparator = new SolidColorBrush(Color.FromRgb(0xD1, 0xD1, 0xD1));
+        // コードブロックの背景（rgba(220,220,220,0.4)）。
+        private static readonly Brush m_vsCodeCodeBlockBackground = new SolidColorBrush(Color.FromRgb(0xF1, 0xF1, 0xF1));
+        // インラインコードの背景（rgba(0,0,0,0.1)）と文字色（赤）。
+        private static readonly Brush m_vsCodeInlineCodeBackground = new SolidColorBrush(Color.FromRgb(0xE6, 0xE6, 0xE6));
+        private static readonly Brush m_vsCodeInlineCodeForeground = new SolidColorBrush(Color.FromRgb(0xA3, 0x15, 0x15));
+        // 引用の背景（rgba(127,127,127,0.1)）と左の縦線（rgba(0,122,204,0.5)）。
+        private static readonly Brush m_vsCodeQuoteBackground = new SolidColorBrush(Color.FromRgb(0xF2, 0xF2, 0xF2));
+        private static readonly Brush m_vsCodeQuoteBorder = new SolidColorBrush(Color.FromRgb(0x80, 0xBD, 0xE6));
+        // 表の見出しの行の下の線（黒）。
+        private static readonly Brush m_vsCodeTableHeaderBorder = new SolidColorBrush(Color.FromRgb(0x00, 0x00, 0x00));
+        // GitHubスタイルの表の見出しの行の背景。
+        private static readonly Brush m_tableHeaderBackground = new SolidColorBrush(Color.FromRgb(0xF8, 0xF8, 0xF8));
+        private static readonly TextDecorationCollection m_noTextDecorations = new TextDecorationCollection();
+
+        /// <summary>VSCodeスタイルの本文フォント（日本語は Yu Gothic UI で表示する）。</summary>
+        public static readonly FontFamily VsCodeEditorFontFamily = new FontFamily("Segoe UI, Yu Gothic UI");
+
+        /// <summary>本文の文字の大きさ（GitHubスタイル 16、VSCodeスタイル 14）。</summary>
+        public static double BodyFontSize => VsCodeStyleFlg ? 14 : 16;
+
+        /// <summary>本文の行の高さ（GitHubスタイル 16×1.5625、VSCodeスタイル 14×1.7）。MainWindow.xaml の EditorLineHeight に設定する。</summary>
+        public static double BodyLineHeight => VsCodeStyleFlg ? 23.8 : 25;
+
+        /// <summary>箇条書きの行の高さ（どちらも文字の大きさの1.6倍）。EditorListLineHeight に設定する。</summary>
+        public static double ListLineHeight => VsCodeStyleFlg ? 22.4 : 25.6;
+
+        /// <summary>箇条書きの項目と項目の間（GitHubスタイル 0.46em、VSCodeスタイルは空けない）。EditorListItemSpacing に設定する。</summary>
+        public static double ListItemSpacing => VsCodeStyleFlg ? 0 : 7.36;
+
+        /// <summary>段落の下の余白（GitHubスタイル 0.7625em、VSCodeスタイル 0.9em）。EditorBlockSpacing に設定する。</summary>
+        public static double ParagraphBottomSpacing => VsCodeStyleFlg ? 12.6 : 12.2;
+
+        /// <summary>箇条書き・表の下の余白（GitHubスタイル 0.8em、VSCodeスタイル 0.9em）。EditorListSpacing に設定する。</summary>
+        public static double ListBottomSpacing => VsCodeStyleFlg ? 12.6 : 12.8;
+
+        /// <summary>箇条書きの左の字下げ（記号の分。GitHubスタイル 32、VSCodeスタイル 2em）。EditorListPadding に設定する。</summary>
+        public static double ListIndent => VsCodeStyleFlg ? 28 : 32;
+
+        /// <summary>番号付きの箇条書きの左の字下げ。EditorDecimalListPadding に設定する。</summary>
+        public static double DecimalListIndent => VsCodeStyleFlg ? 30 : 34;
+
+        /// <summary>太字の太さ（VSCodeスタイルは少し細い太字）。</summary>
+        public static FontWeight BoldFontWeight => VsCodeStyleFlg ? FontWeights.SemiBold : FontWeights.Bold;
+
+        /// <summary>リンクの文字の線（GitHubスタイルは下線、VSCodeスタイルは下線なし）。</summary>
+        public static TextDecorationCollection LinkTextDecorations => VsCodeStyleFlg ? m_noTextDecorations : TextDecorations.Underline;
+
+        /// <summary>表の見出しの行の背景（VSCodeスタイルは背景なし＝null）。</summary>
+        public static Brush TableHeaderBackground => VsCodeStyleFlg ? null : m_tableHeaderBackground;
+
+        /// <summary>表のセルの内側の余白（mdew・mdee と同じ。GitHubスタイル 左右10・上下4、VSCodeスタイル 左右10・上下5）。</summary>
+        public static Thickness TableCellPadding => VsCodeStyleFlg ? new Thickness(10, 5, 10, 5) : new Thickness(10, 4, 10, 4);
+
+        /// <summary>引用の上・下の余白。</summary>
+        public static double QuoteTopMargin => VsCodeStyleFlg ? 0 : 4;
+        public static double QuoteBottomMargin => VsCodeStyleFlg ? 12.6 : 10;
+
+        /// <summary>表のセルの行の高さ。GitHubスタイルは本文と同じ 25（mdew・mdee の表のセルと同じ。16px の 1.5625 倍）。
+        /// VSCodeスタイルは VSCode の表と同じ 22.4（14px の 1.6 倍）。フォントの自然な高さ（約 18.6）だと、VSCode より
+        /// 1行あたり約 4px 狭くなるため。</summary>
+        public static double TableCellLineHeight => VsCodeStyleFlg ? 22.4 : 25;
+
+        /// <summary>コードブロックの背景色（他クラスからも参照できるよう公開）。</summary>
+        public static Brush CodeBlockBackgroundBrush => VsCodeStyleFlg ? m_vsCodeCodeBlockBackground : m_codeBlockBackground;
+
+        /// <summary>インラインコードの背景色（他クラスからも参照できるよう公開）。</summary>
+        public static Brush InlineCodeBackgroundBrush => VsCodeStyleFlg ? m_vsCodeInlineCodeBackground : m_inlineCodeBackground;
+
+        /// <summary>コードブロック・インラインコードのフォント（GitHubスタイルは mdew と同じで日本語は Meiryo、
+        /// VSCodeスタイルは日本語を Yu Gothic UI で表示する）。</summary>
+        public static FontFamily CodeFontFamily => VsCodeStyleFlg ? m_vsCodeCodeFontFamily : m_codeFontFamily;
+        private static readonly FontFamily m_codeFontFamily = new FontFamily("Consolas, Meiryo");
+        private static readonly FontFamily m_vsCodeCodeFontFamily = new FontFamily("Consolas, Courier New, Yu Gothic UI");
+
+        /// <summary>コードブロックの文字の大きさ（mdew と同じ。どちらのスタイルも 14）。</summary>
+        public const double CODE_BLOCK_FONT_SIZE = 14;
+
+        /// <summary>インラインコードの文字の大きさ（GitHubスタイルは本文 16px の 0.92 倍、VSCodeスタイルは本文と同じ 14）。</summary>
+        public static double INLINE_CODE_FONT_SIZE => VsCodeStyleFlg ? 14 : 14.72;
+
+        /// <summary>Run にインラインコードの見た目（フォント・大きさ・背景、VSCodeスタイルでは赤い文字）を付ける。
+        /// Tag は呼び出し側で付ける。</summary>
+        /// <param name="a_run">対象の Run。</param>
+        /// <returns>a_run（そのまま返す）。</returns>
+        public static Run ApplyInlineCodeStyle(Run a_run)
+        {
+            a_run.FontFamily = CodeFontFamily;
+            a_run.FontSize = INLINE_CODE_FONT_SIZE;
+            a_run.Background = InlineCodeBackgroundBrush;
+            if (VsCodeStyleFlg)
+            {
+                a_run.Foreground = m_vsCodeInlineCodeForeground;
+            }
+            return a_run;
+        }
+
+        /// <summary>ハイライト（==text==）の背景色（他クラスからも参照できるよう公開）。</summary>
+        public static Brush HighlightBrush => m_highlightBackground;
+
+        /// <summary>段落を、見出し・コードブロック等の特別な見た目が付く前の状態にリセットする。</summary>
+        /// <param name="a_p">対象の段落。</param>
+        public static void ClearSpecialStyling(Paragraph a_p)
+        {
+            a_p.Background = null;
+            a_p.Padding = new Thickness(0);
+            a_p.BorderThickness = new Thickness(0);
+            a_p.BorderBrush = null;
+            a_p.ClearValue(TextElement.FontFamilyProperty);
+            // 引用スタイル（ApplyQuoteStyle）が設定するForegroundを、他の種類へ変換した際や
+            // 本文へ戻した際に確実に解除する。見出し・コードブロック・水平線はForegroundを
+            // 設定しないため、この行を追加してもそれらの動作には影響しない。
+            a_p.ClearValue(TextElement.ForegroundProperty);
+            // 見出しスタイル（ApplyHeadingStyle）が設定するLineHeightのローカル値を、他の種類へ
+            // 変換した際や本文へ戻した際に確実に解除する。これが無いと、見出しだった段落を
+            // 本文や引用へ変換した後も、見出し用の大きいLineHeightがローカル値として残ってしまい、
+            // RichTextBoxのStyle側のLineHeight（EditorLineHeight）が効かなくなる。
+            a_p.ClearValue(Paragraph.LineHeightProperty);
+        }
+
+        /// <summary>段落に見出しスタイルを適用する（a_level=0 なら本文スタイルに戻す）。</summary>
+        /// <param name="a_p">対象の段落。</param>
+        /// <param name="a_level">見出しレベル（0〜6。0は本文）。</param>
+        public static void ApplyHeadingStyle(Paragraph a_p, int a_level)
+        {
+            ClearSpecialStyling(a_p);
+            a_p.Tag = 0 == a_level ? null : (object)a_level;
+            if (0 == a_level)
+            {
+                a_p.FontSize = BodyFontSize;
+                a_p.FontWeight = FontWeights.Normal;
+                // Marginはここでは明示的に設定しない。RichTextBoxのStyle側でEditorBlockSpacing
+                // （固定値。MainWindow.xamlのEditorBlockSpacing
+                // 参照）が適用されることで、段落と段落の間の間隔が、行間の設定を変えても
+                // 常に一定になるようにしている（ここでローカル値として設定すると、そちらを
+                // 上書きしてしまい、連動しなくなる）。
+                a_p.ClearValue(Paragraph.MarginProperty);
+            }
+            else if (VsCodeStyleFlg)
+            {
+                // VSCodeスタイル：本文 14px に対して 2/1.5/1.25/1/0.875/0.85 倍、少し細い太字（600）、
+                // 行の高さは文字の 1.25 倍、上 24・下 16 の余白。大見出し・中見出しの下に淡い灰色の線
+                // （文字から線までは文字の 0.3 倍）。
+                double[] ems = { 0, 2, 1.5, 1.25, 1, 0.875, 0.85 };
+                double size = 14 * ems[a_level];
+                a_p.FontSize = size;
+                a_p.FontWeight = FontWeights.SemiBold;
+                a_p.Margin = new Thickness(0, 24, 0, 16);
+                a_p.LineHeight = size * 1.25;
+                if (a_level <= 2)
+                {
+                    a_p.BorderBrush = m_vsCodeSeparator;
+                    a_p.BorderThickness = new Thickness(0, 0, 0, 1);
+                    a_p.Padding = new Thickness(0, 0, 0, size * 0.3);
+                }
+                else
+                {
+                    a_p.BorderThickness = new Thickness(0);
+                }
+            }
+            else
+            {
+                // GitHubスタイル：mdew・mdee と同じく、本文 16px に対して 2.25/1.75/1.5/1.25/1/1 倍、上に文字の 1.2 倍・
+                // 下に 0.6 倍の余白（前の段落の下の余白とは重ならず、大きい方になる。HTML と同じ）
+                double[] ems = { 0, 2.25, 1.75, 1.5, 1.25, 1, 1 };
+                double size = 16 * ems[a_level];
+                a_p.FontSize = size;
+                a_p.FontWeight = FontWeights.Bold;
+                a_p.Margin = new Thickness(0, size * 1.2, 0, size * 0.6);
+                // 見出しのLineHeightは、本文用のEditorLineHeight（25。MainWindow.xaml参照。以前は「表示」→
+                // 「行間を設定」で変更可）をそのまま使うのではなく、見出しのFontSizeに応じた
+                // 専用の値をローカル値として指定する（RichTextBoxのStyle側のLineHeightより、
+                // ここで設定するローカル値の方が優先される）。本文と同じ1行の目安（約1.2倍）に
+                // 揃えることで、見出しの文字から下線までの余白が、本文の行間と不釣り合いに
+                // 広がらないようにしている（LineStackingStrategy=BlockLineHeightと組み合わせる
+                // ことで、フォント（新しいフォント／以前のフォント）が変わってもこの値がそのまま
+                // 使われる。MainWindow.xamlのStyle TargetType="Paragraph"参照）。
+                // 行の高さは mdew・mdee と同じ、文字の 1.4 倍。
+                a_p.LineHeight = size * 1.4;
+                if (a_level <= 2)
+                {
+                    // 大見出し・中見出しの下の線は、mdew・mdee と同じ 1px の #B4B4B4（以前は 0.75・0.5px で、薄く見えていた）。
+                    // 線はピクセルに合わせてくっきり描く（MainWindow.ApplyEditorEdgeMode）
+                    a_p.BorderBrush = m_cellBorder;
+                    a_p.BorderThickness = new Thickness(0, 0, 0, 1);
+                    a_p.Padding = new Thickness(0, 0, 0, 4);
+                }
+                else
+                {
+                    a_p.BorderThickness = new Thickness(0);
+                }
+            }
+        }
+
+        /// <summary>段落にコードブロックスタイル（等幅フォント・背景色・枠線）を適用する。</summary>
+        /// <param name="a_p">対象の段落。</param>
+        /// <param name="a_language">```の直後の言語タグ（ツールチップに表示される）。</param>
+        /// <param name="a_isLastLine">true（既定値）: このコードブロックの最後の行（単独の
+        /// 1行だけのコードブロックの場合はこれがそのまま使われる。下側の枠線・余白を持つ）。
+        /// false: Enterによる続きの行（CodeBlockContinuationInfo）が後ろに続く場合。箱の
+        /// 下側は続きの段落側が担当するため、この段落自身の下側の枠線・余白は無くす
+        /// （HeadingCodeBlockEditor.InsertCodeBlockContinuationParagraph・
+        /// MarkdownConverter.MarkdownToDocument参照）。</param>
+        public static void ApplyCodeBlockStyle(Paragraph a_p, string a_language = "", bool a_isLastLine = true)
+        {
+            ClearSpecialStyling(a_p);
+            a_p.Tag = new CodeBlockInfo { Language = a_language ?? "" };
+            a_p.FontFamily = CodeFontFamily;
+            a_p.FontSize = CODE_BLOCK_FONT_SIZE;
+            a_p.FontWeight = FontWeights.Normal;
+            a_p.Background = CodeBlockBackgroundBrush;
+            a_p.BorderBrush = m_codeBlockBorder;
+            if (VsCodeStyleFlg)
+            {
+                // VSCodeスタイル：枠線なし、内側の余白 16、行の高さは文字の約 1.357 倍、下の余白 0.9em。
+                a_p.LineHeight = 19;
+                a_p.BorderThickness = new Thickness(0);
+                a_p.Padding = new Thickness(16, 16, 16, a_isLastLine ? 16 : 0);
+                a_p.Margin = new Thickness(0, 0, 0, a_isLastLine ? 12.6 : 0);
+            }
+            else if (a_isLastLine)
+            {
+                a_p.Padding = new Thickness(16, 8, 16, 8);
+                a_p.Margin = new Thickness(0, 4, 0, 14);
+                a_p.BorderThickness = new Thickness(1);
+            }
+            else
+            {
+                a_p.Padding = new Thickness(16, 8, 16, 0);
+                a_p.Margin = new Thickness(0, 4, 0, 0);
+                a_p.BorderThickness = new Thickness(1, 1, 1, 0);
+            }
+            ToolTipService.SetToolTip(a_p, string.IsNullOrEmpty(a_language) ? "コードブロック" : "コードブロック (" + a_language + ")");
+        }
+
+        /// <summary>段落に、コードブロックの2行目以降（Enterによる続きの行）のスタイルを適用する。
+        /// フォント・背景色等はApplyCodeBlockStyleと同じだが、Tagには先頭行と区別するため
+        /// CodeBlockContinuationInfoを設定する。引用（ApplyQuoteContinuationStyle）と異なり、
+        /// コードブロックは四辺を枠線で囲んだ箱の見た目のため、グループ内での位置（このIME
+        /// 続き行が今、グループの最後の行かどうか）に応じて、上下の枠線・パディング・
+        /// マージンをここで直接出し分ける（左右の枠線・背景色はどの位置でも共通）。これにより、
+        /// 複数のParagraphに分かれていても、1つの継ぎ目のない箱に見える。</summary>
+        /// <param name="a_p">対象の段落。</param>
+        /// <param name="a_isLastLine">true: このグループの最後の行（下側の枠線・パディング・
+        /// 余白を持つ）。false: まだ後ろに続きの行がある途中の行（上下とも枠線・パディングを
+        /// 持たず、前後の行と隙間なくつながって見える）。</param>
+        public static void ApplyCodeBlockContinuationStyle(Paragraph a_p, bool a_isLastLine)
+        {
+            ClearSpecialStyling(a_p);
+            a_p.Tag = new CodeBlockContinuationInfo();
+            a_p.FontFamily = CodeFontFamily;
+            a_p.FontSize = CODE_BLOCK_FONT_SIZE;
+            a_p.FontWeight = FontWeights.Normal;
+            a_p.Background = CodeBlockBackgroundBrush;
+            a_p.BorderBrush = m_codeBlockBorder;
+            if (VsCodeStyleFlg)
+            {
+                // VSCodeスタイル（ApplyCodeBlockStyle と同じ値）。
+                a_p.LineHeight = 19;
+                a_p.BorderThickness = new Thickness(0);
+                a_p.Padding = new Thickness(16, 0, 16, a_isLastLine ? 16 : 0);
+                a_p.Margin = new Thickness(0, 0, 0, a_isLastLine ? 12.6 : 0);
+            }
+            else if (a_isLastLine)
+            {
+                a_p.Padding = new Thickness(16, 0, 16, 8);
+                a_p.Margin = new Thickness(0, 0, 0, 14);
+                a_p.BorderThickness = new Thickness(1, 0, 1, 1);
+            }
+            else
+            {
+                a_p.Padding = new Thickness(16, 0, 16, 0);
+                a_p.Margin = new Thickness(0);
+                a_p.BorderThickness = new Thickness(1, 0, 1, 0);
+            }
+        }
+
+        /// <summary>段落に水平線（&lt;hr&gt;相当）スタイルを適用する。</summary>
+        /// <param name="a_p">対象の段落。中身（Inlines）は空のままにする想定。</param>
+        public static void ApplyHorizontalRuleStyle(Paragraph a_p)
+        {
+            ClearSpecialStyling(a_p);
+            a_p.Tag = new HorizontalRuleInfo();
+            a_p.FontSize = 1;
+            a_p.BorderBrush = VsCodeStyleFlg ? m_vsCodeSeparator : m_cellBorder;
+            a_p.BorderThickness = new Thickness(0, 1, 0, 0);
+            a_p.Margin = VsCodeStyleFlg ? new Thickness(0, 16.8, 0, 16.8) : new Thickness(0, 14, 0, 14);
+            a_p.Padding = new Thickness(0);
+        }
+
+        /// <summary>段落に引用（&gt; 相当）スタイルを適用する（a_quoted=falseなら本文スタイルに
+        /// 戻す）。見出し（ApplyHeadingStyle）と同じ「a_levelの代わりにbool、ClearSpecialStyling
+        /// を先に呼んでから改めて設定する」パターンに従う。</summary>
+        /// <param name="a_p">対象の段落。</param>
+        /// <param name="a_quoted">true: 引用スタイルを適用。false: 本文スタイルに戻す。</param>
+        /// <param name="a_isLastLine">true（既定値）: この引用グループの最後の行（続きの行が
+        /// 無い、単独の1行だけの引用の場合はこれがそのまま使われる。下方向のパディングを
+        /// 持つ）。false: 後ろにQuoteContinuationInfoの続きの行がある場合。コードブロック
+        /// （ApplyCodeBlockStyleのa_isLastLine）と同じ考え方で、下方向のパディングを無くし、
+        /// 次の行と行間が詰まって見えるようにする（a_quoted=falseの場合は無視される）。</param>
+        public static void ApplyQuoteStyle(Paragraph a_p, bool a_quoted, bool a_isLastLine = true)
+        {
+            ClearSpecialStyling(a_p);
+            a_p.Tag = a_quoted ? (object)new QuoteInfo() : null;
+            if (!a_quoted)
+            {
+                // ApplyHeadingStyleのa_level=0の場合と同じ値に戻す。
+                a_p.FontSize = BodyFontSize;
+                a_p.FontWeight = FontWeights.Normal;
+                a_p.ClearValue(Paragraph.MarginProperty);
+            }
+            else
+            {
+                a_p.FontSize = BodyFontSize;
+                a_p.FontWeight = FontWeights.Normal;
+                if (VsCodeStyleFlg)
+                {
+                    // VSCodeスタイル：文字の色は本文と同じ、左に淡い青の太い縦線、上下の余白なし
+                    // （上下のパディングは0。a_isLastLine によらない）。
+                    a_p.Background = m_vsCodeQuoteBackground;
+                    a_p.BorderBrush = m_vsCodeQuoteBorder;
+                    a_p.BorderThickness = new Thickness(5, 0, 0, 0);
+                    a_p.Padding = new Thickness(10, 0, 16, 0);
+                    a_p.Margin = new Thickness(0, QuoteTopMargin, 0, QuoteBottomMargin);
+                    return;
+                }
+                a_p.Foreground = m_quoteForeground;
+                a_p.Background = m_quoteBackground;
+                // 左側だけに太い縦線を引く、一般的な引用（blockquote）の見た目。
+                a_p.BorderBrush = m_cellBorder;
+                a_p.BorderThickness = new Thickness(3, 0, 0, 0);
+                // この段落は常に引用グループの先頭行であるため、上方向のパディングは常に
+                // 持たせる。下方向のパディングだけ、グループ最後の行かどうかで出し分ける
+                // （コードブロックのApplyCodeBlockStyleと同じ考え方。これが無いと、複数行の
+                // 引用で1行ごとに上下6pxずつ、計12pxの余計な隙間ができ、行間がコードブロックや
+                // 箇条書きより不自然に広く見えてしまう）。
+                a_p.Padding = new Thickness(12, 6, 8, a_isLastLine ? 6 : 0);
+                // 下マージンは、この段落が引用の最後の行である場合の値（続きの行が無い、
+                // 単独の1行だけの引用の場合はこれがそのまま使われる）。Enterで続きの行が
+                // 追加される場合は、呼び出し元（HeadingCodeBlockEditor.
+                // InsertQuoteContinuationParagraph・MarkdownConverter.MarkdownToDocument）が
+                // この下マージンを新しい最後の行の段落へ付け替え、この段落自身の下マージンを
+                // 0にする。
+                a_p.Margin = new Thickness(0, QuoteTopMargin, 0, QuoteBottomMargin);
+            }
+        }
+
+        /// <summary>段落に、引用の2行目以降（Enterによる続きの行）のスタイルを適用する。
+        /// 見た目（文字色・背景・左の縦線）はApplyQuoteStyleのa_quoted=trueの場合と同じだが、
+        /// Tagには先頭行と区別するためQuoteContinuationInfoを設定する。Marginは呼び出し元が
+        /// 前後の段落との関係（この段落が今グループ内で最後の行かどうか）を見て個別に設定する
+        /// ため、ここでは触れない（BrContinuationInfoの続き段落と同じ考え方。MarkdownConverter.
+        /// MarkdownToDocumentのbrSegments処理、HeadingCodeBlockEditor.
+        /// InsertQuoteContinuationParagraph参照）。</summary>
+        /// <param name="a_p">対象の段落。</param>
+        /// <param name="a_isLastLine">true: このグループの最後の行（下方向のパディングを持つ）。
+        /// false: まだ後ろに続きの行がある途中の行（上下ともパディングを持たず、前後の行と
+        /// 隙間なくつながって見える）。続きの行は先頭行ではないため、上方向のパディングは
+        /// 常に0にする（ApplyCodeBlockContinuationStyleと同じ考え方）。</param>
+        public static void ApplyQuoteContinuationStyle(Paragraph a_p, bool a_isLastLine)
+        {
+            ClearSpecialStyling(a_p);
+            a_p.Tag = new QuoteContinuationInfo();
+            a_p.FontSize = BodyFontSize;
+            a_p.FontWeight = FontWeights.Normal;
+            if (VsCodeStyleFlg)
+            {
+                // VSCodeスタイル（ApplyQuoteStyle と同じ値）。
+                a_p.Background = m_vsCodeQuoteBackground;
+                a_p.BorderBrush = m_vsCodeQuoteBorder;
+                a_p.BorderThickness = new Thickness(5, 0, 0, 0);
+                a_p.Padding = new Thickness(10, 0, 16, 0);
+                return;
+            }
+            a_p.Foreground = m_quoteForeground;
+            a_p.Background = m_quoteBackground;
+            a_p.BorderBrush = m_cellBorder;
+            a_p.BorderThickness = new Thickness(3, 0, 0, 0);
+            a_p.Padding = new Thickness(12, 0, 8, a_isLastLine ? 6 : 0);
+        }
+
+        /// <summary>タスクリスト用チェックボックスを生成する。MarkdownConverter（バッチ変換）と
+        /// ListEditor（ライブ入力変換）の両方から共有で使い、見た目が食い違わないようにする
+        /// 共通ヘルパー。幅・高さを固定しているのは、既定のCheckBoxはOSテーマ等で描画サイズが
+        /// わずかに変わり、行の高さが不安定に見えるため（Paragraph.LineHeightは最低高さでしか
+        /// なく、埋め込みUIElementが大きいと行全体が伸びる）。Marginの上側は、行頭マーカー
+        /// （「・」）に対するチェックボックスの縦位置を微調整するための値（エディタの既定
+        /// フォント実測に合わせて調整済み。フォントを変更した場合は再調整が必要）で、段落の
+        /// 文字位置・TextPointer・IME関連の処理には関わらない。見た目はApp.xamlの
+        /// TaskCheckboxStyle（白地＋枠線、Typoraの表示に合わせたもの）を適用する。
+        /// </summary>
+        /// <param name="a_checked">チェック済み状態（[x]）かどうか。</param>
+        public static CheckBox CreateTaskCheckbox(bool a_checked)
+        {
+            var checkbox = new CheckBox
+            {
+                IsChecked = a_checked,
+                Width = 15,
+                Height = 15,
+                VerticalAlignment = VerticalAlignment.Center,
+                VerticalContentAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 4, 0),
+                Tag = "task-checkbox"
+            };
+            if (Application.Current?.Resources["TaskCheckboxStyle"] is Style taskCheckboxStyle)
+            {
+                checkbox.Style = taskCheckboxStyle;
+            }
+            return checkbox;
+        }
+
+        /// <summary>CreateTaskCheckboxで生成したチェックボックスを、行頭の箇条書きマーカー
+        /// （「・」等）に対して縦方向中央に揃えた状態でInlineUIContainerに包んで返す。
+        /// InlineUIContainerの既定のBaselineAlignmentは"Baseline"（埋め込み要素の下端を
+        /// テキストのベースラインに合わせる）のため、正方形のチェックボックスが文字の上側に
+        /// はみ出してマーカーより高い位置にずれる。BaselineAlignment="Center"にすることで
+        /// チェックボックスの縦方向中央を行の中央へ揃える。段落への挿入箇所（ListEditor・
+        /// MarkdownConverter）はすべてこのヘルパー経由にし、見た目の食い違いを防ぐ。</summary>
+        /// <param name="a_checked">チェック済み状態（[x]）かどうか。</param>
+        public static InlineUIContainer CreateTaskCheckboxContainer(bool a_checked)
+        {
+            return new InlineUIContainer(CreateTaskCheckbox(a_checked))
+            {
+                BaselineAlignment = BaselineAlignment.Center
+            };
+        }
+
+        /// <summary>
+        /// 画像（InlineUIContainer+Image）を含む段落だけ、行の高さの固定（LineHeight＋
+        /// LineStackingStrategy=BlockLineHeight。MainWindow.xamlのStyle TargetType="Paragraph"参照）を
+        /// 外し、画像の高さに合わせて行が広がるようにする。
+        ///
+        /// 【全画面表示にするとDESIGN.mdの目次末尾〜4章の見出しの手前の表示が崩れる不具合の修正】
+        /// 段落には行間を統一するため「行の高さを常にEditorLineHeight（既定26px）に固定する」
+        /// BlockLineHeightが適用されている。画像はInlineUIContainerとして文字と同じ「行」に
+        /// 置かれ、下端が行の基準線に揃うため、行の高さが固定されたままだと、画像の高さのうち
+        /// 26pxを超えた分が上方向へはみ出して直前の文章に重なって描画され、画像の段落自身は
+        /// 26px分の高さしか確保されない。通常サイズでは画像がエディタ幅に合わせて縮小されて
+        /// いるため重なりは小さいが、全画面ではほぼ原寸まで拡大されるため、数百pxの画像が
+        /// 1〜3章の文章全体を覆い隠していた。表のセル内の段落は従来からLineHeight=NaNにして
+        /// 同様の問題を避けているので、画像を含む表の外の段落にも同じ考え方を適用する。
+        /// 既にLineHeightがNaN（表のセル等）の段落や、画像を含まない段落には何もしない。
+        /// </summary>
+        /// <param name="a_p">対象の段落（nullなら何もしない）。</param>
+        public static void ApplyImageParagraphLineHeight(Paragraph a_p)
+        {
+            if (null == a_p ||
+                double.IsNaN(a_p.LineHeight) ||
+                !InlinesContainImage(a_p.Inlines))
+            {
+                return;
+            }
+            a_p.LineHeight = double.NaN;
+            a_p.LineStackingStrategy = LineStackingStrategy.MaxHeight;
+        }
+
+        /// <summary>指定したインライン要素（挿入した画像のInlineUIContainerなど）を含む段落に
+        /// ついて、ApplyImageParagraphLineHeightを適用する。Span等で包まれている場合も、
+        /// 論理ツリーを上へたどって段落を見つける。</summary>
+        /// <param name="a_inline">段落内のインライン要素。</param>
+        public static void ApplyImageParagraphLineHeightFor(Inline a_inline)
+        {
+            object parent = a_inline?.Parent;
+            while (parent is Span span)
+            {
+                parent = span.Parent;
+            }
+            ApplyImageParagraphLineHeight(parent as Paragraph);
+        }
+
+        /// <summary>インライン列（Span内も含む）に画像が1つでもあるかを返す。</summary>
+        /// <param name="a_inlines">調べるインライン列。</param>
+        /// <returns>画像を含む場合true。</returns>
+        private static bool InlinesContainImage(InlineCollection a_inlines)
+        {
+            foreach (Inline inline in a_inlines)
+            {
+                if (inline is InlineUIContainer iuc && iuc.Child is Image)
+                {
+                    return true;
+                }
+                if (inline is Span span && InlinesContainImage(span.Inlines))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>不順序リスト（箇条書き）のマーカー種別を、ネストの段数（1始まり）から決める。
+        /// a_uniformFlgがfalse（既定）の場合はWPF標準の割り当て：VSCode等と同様、1段目は
+        /// Disc（・）、2段目はCircle（輪郭だけの丸）、3段目以降はBox（塗りつぶしの四角）にする。
+        /// trueの場合は、段数によらず常にDisc（・）にする（メニュー「表示」→「箇条書きの記号」
+        /// 参照）。MarkdownConverter（バッチ変換）とListEditor（ライブ編集でのTab字下げ・
+        /// 字下げ解除）の両方から共有で使う。</summary>
+        /// <param name="a_depth">ネストの段数（1始まり）。</param>
+        /// <param name="a_uniformFlg">true＝段数によらず常にDiscにする（すべての階層に同じ記号を
+        /// 使用する）、false（既定）＝WPF標準の割り当て（1段目Disc・2段目Circle・3段目以降
+        /// Box）。</param>
+        /// <returns>対応するTextMarkerStyle。</returns>
+        public static TextMarkerStyle UnorderedMarkerStyleForDepth(int a_depth, bool a_uniformFlg = false)
+        {
+            if (a_uniformFlg)
+            {
+                return TextMarkerStyle.Disc;
+            }
+            if (a_depth <= 1)
+            {
+                return TextMarkerStyle.Disc;
+            }
+            if (2 == a_depth)
+            {
+                return TextMarkerStyle.Circle;
+            }
+            return TextMarkerStyle.Box;
+        }
+
+        // ======================================================================
+        //  表の罫線（境界線の単線化）
+        // ======================================================================
+
+        /// <summary>行の終わりで、文字の幅の半分だけ詰めて表示できる閉じ括弧（全角）。mdew・mdee（Chromium）は、行に入り切らない
+        /// 時、行の終わりの閉じ括弧を半分の幅に詰めて（CSS の text-spacing-trim の既定値。allow-end）同じ行に収める。読点・句点
+        /// （、。）等は詰めない（Chromium で確かめた）。</summary>
+        private const string LINE_END_TRIMMABLE_BRACKETS = "）〕］｝〉》」』】〙〗〟";
+
+        /// <summary>
+        /// 表のセルの段落が閉じ括弧で終わる場合に、mdew・mdee（Chromium）と同じく、その閉じ括弧が文字の幅の半分だけセルの右の
+        /// 余白にはみ出してもよいようにする（例えば「（x64 用）」が、括弧の半分の幅だけ足りない列でも1行に収まる）。WPF は
+        /// 括弧を詰めて表示できないため、その段落のあるセルの右の余白（Padding）を半文字分だけ小さくし、同じセルの閉じ括弧で
+        /// 終わらない段落には、その分の右の余白（Margin）を付けて、見た目の余白は変えない。表を作る時（MarkdownConverter・
+        /// TableEditor.InsertParsedTable）だけ行う（編集中に変えると、元に戻すの操作に見えない変更が入るため）。
+        /// 段落の途中の行の終わりの閉じ括弧は対象外（WPF ではどこで折り返すか分からないため）。
+        /// </summary>
+        /// <param name="a_table">対象の表。</param>
+        public static void ApplyClosingBracketLineEndAllowance(Table a_table)
+        {
+            double allowance = BodyFontSize / 2;
+            Thickness basePadding = TableCellPadding;
+            foreach (TableRowGroup rg in a_table.RowGroups)
+            {
+                foreach (TableRow row in rg.Rows)
+                {
+                    foreach (TableCell cell in row.Cells)
+                    {
+                        var paras = cell.Blocks.OfType<Paragraph>().ToList();
+                        if (!paras.Any(EndsWithTrimmableBracket))
+                        {
+                            continue;
+                        }
+                        Thickness pad = cell.Padding;
+                        cell.Padding = new Thickness(pad.Left, pad.Top, Math.Max(0, basePadding.Right - allowance), pad.Bottom);
+                        foreach (Paragraph p in paras)
+                        {
+                            Thickness m = p.Margin;
+                            p.Margin = new Thickness(m.Left, m.Top, EndsWithTrimmableBracket(p) ? 0 : allowance, m.Bottom);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>段落の文字が、LINE_END_TRIMMABLE_BRACKETS の閉じ括弧で終わるか（後ろの空白・見えない文字は除く）。</summary>
+        /// <param name="a_para">対象の段落。</param>
+        /// <returns>閉じ括弧で終わるなら true。</returns>
+        private static bool EndsWithTrimmableBracket(Paragraph a_para)
+        {
+            var sb = new StringBuilder();
+            void Append(InlineCollection a_inlines)
+            {
+                foreach (Inline inline in a_inlines)
+                {
+                    if (inline is Run run)
+                    {
+                        sb.Append(run.Text);
+                    }
+                    else if (inline is Span span)
+                    {
+                        Append(span.Inlines);
+                    }
+                    else
+                    {
+                        sb.Append('\uFFFC'); // 改行・画像等：その前の文字は段落の終わりではない
+                    }
+                }
+            }
+            Append(a_para.Inlines);
+            string text = StripUrlBreakJoiners(sb.ToString()).Replace("\u200B", "").TrimEnd();
+            return 0 < text.Length && 0 <= LINE_END_TRIMMABLE_BRACKETS.IndexOf(text[text.Length - 1]);
+        }
+
+        /// <summary>
+        /// 表の全セルに、隣接セルと境界線が二重に重ならないよう調整した罫線を設定する。
+        /// WPFの<see cref="Table"/>/<see cref="TableCell"/>にはCSSの
+        /// <c>border-collapse: collapse</c>に相当する機能が無く、全セルへ4辺とも罫線を
+        /// 付けると隣接セルの境界に2本の罫線が重なり、非整数DPIや印刷（PDF出力）では
+        /// 位置がずれてぼやけたり片方が消えたりする。そこで、全セルは例外なく同一の
+        /// Thickness（右辺・下辺のみ）を持ち、表の外周の上辺・左辺は<see cref="Table"/>
+        /// 自身（<see cref="TableCell"/>とは独立したBorderBrush/BorderThicknessを持てる）
+        /// が1回だけ描く。
+        /// ヘッダー行（最上段）のセル間の縦の区切り線（行内で最後ではないセルの右辺）だけは
+        /// 本文行より少し太く（<see cref="HEADER_VERTICAL_BORDER_THICKNESS"/>）描く。これは
+        /// WPFの印刷パイプラインが極端に細い罫線（1px相当）を特定条件下でラスタライズし
+        /// 損ね、ヘッダー行の縦罫線だけ印刷時に消えることがあるための対策（太さを変える
+        /// 対策のみ有効、色を変える対策は無効と確認済み）。WYSIWYGモードの見た目には
+        /// ほぼ影響しない。この消失は隣接セル間の内部の区切り線でのみ発生し、表の外周
+        /// （各行最後のセルの右辺）では発生しないため、最後のセルの右辺は太さを変えず
+        /// 本文行と同じにする。
+        /// 呼び出し側は、行・列の挿入や削除など表の構造を変えた直後に、表全体に対して
+        /// 毎回呼び直すこと（個々の操作ごとに追いかけるより、常に表全体を作り直す方が
+        /// 境界線の消失・重複を防ぎやすい）。
+        /// </summary>
+        /// <param name="a_table">対象の表（RowGroups・Rows・Cellsまで構築済みであること）。</param>
+        /// <param name="a_borderBrush">罫線の色（呼び出し側が使っているm_cellBorderを渡す）。</param>
+        public static void ApplyTableCellBorders(Table a_table, Brush a_borderBrush)
+        {
+            if (VsCodeStyleFlg)
+            {
+                ApplyVsCodeTableCellBorders(a_table);
+                return;
+            }
+            // 表自身の外周（上辺・左辺）を1回だけ描く。
+            a_table.BorderBrush = a_borderBrush;
+            a_table.BorderThickness = new Thickness(1, 1, 0, 0);
+
+            // 全セルの右辺・下辺に罫線を描く。ヘッダー行の内部区切り線だけ太くする
+            // （HEADER_VERTICAL_BORDER_THICKNESS）。行内最後のセルの右辺（表の外周）は
+            // 本文行と同じ太さ（1）のまま。
+            int rowIndex = 0;
+            foreach (TableRowGroup rg in a_table.RowGroups)
+            {
+                foreach (TableRow row in rg.Rows)
+                {
+                    int cellCount = row.Cells.Count;
+                    int cellIndex = 0;
+                    foreach (TableCell cell in row.Cells)
+                    {
+                        bool isLastCellInRow = (cellIndex == cellCount - 1);
+                        double right = (0 == rowIndex && !isLastCellInRow) ? HEADER_VERTICAL_BORDER_THICKNESS : 1;
+                        cell.BorderBrush = a_borderBrush;
+                        cell.BorderThickness = new Thickness(0, 0, right, 1);
+                        cellIndex++;
+                    }
+                    rowIndex++;
+                }
+            }
+        }
+
+        /// <summary>VSCodeスタイルの表の罫線：縦の線と外周の線は引かず、見出しの行の下だけ黒い線、
+        /// 本文の行と行の間は淡い灰色の線にする（最後の行の下には引かない）。</summary>
+        /// <param name="a_table">対象の表。</param>
+        private static void ApplyVsCodeTableCellBorders(Table a_table)
+        {
+            a_table.BorderBrush = null;
+            a_table.BorderThickness = new Thickness(0);
+            var rows = a_table.RowGroups.SelectMany(rg => rg.Rows).ToList();
+            for (int rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+            {
+                bool headerFlg = 0 == rowIndex;
+                bool lastRowFlg = rowIndex == rows.Count - 1;
+                foreach (TableCell cell in rows[rowIndex].Cells)
+                {
+                    cell.BorderBrush = headerFlg ? m_vsCodeTableHeaderBorder : m_vsCodeSeparator;
+                    cell.BorderThickness = new Thickness(0, 0, 0, headerFlg || !lastRowFlg ? 1 : 0);
+                }
+            }
+        }
+
+        /// <summary>PDF出力時の表の罫線の太さ（px。1px = 0.75pt）。画面と同じ 1px にそろえる
+        /// （画面ではヘッダー行のセル間の縦線だけ太いため、そのまま書き出すとその線だけ太く見えていた）。</summary>
+        public const double PRINT_TABLE_BORDER_THICKNESS = 1;
+
+        /// <summary>PDF出力時の表の罫線の色。画面の色（#DDDFE2）のままだと、PDFビューアで線が
+        /// 画素の境目にかかった時に2画素へ薄く分かれて、ほとんど見えなくなる。分かれた時でも
+        /// 画面の線と同じくらいの濃さに見えるよう、少しだけ濃くした灰色にする。</summary>
+        private static readonly Brush m_printTableBorder = CreateFrozenBrush(0xB4, 0xB8, 0xBD);
+
+        /// <summary>固定した（変更できない・スレッドをまたいで使える）単色のブラシを作る。</summary>
+        /// <param name="a_r">赤。</param>
+        /// <param name="a_g">緑。</param>
+        /// <param name="a_b">青。</param>
+        /// <returns>ブラシ。</returns>
+        private static Brush CreateFrozenBrush(byte a_r, byte a_g, byte a_b)
+        {
+            var brush = new SolidColorBrush(Color.FromRgb(a_r, a_g, a_b));
+            brush.Freeze();
+            return brush;
+        }
+
+        /// <summary>
+        /// PDF出力の間だけ、表の罫線を <see cref="m_printTableBorder"/>・<see cref="PRINT_TABLE_BORDER_THICKNESS"/> にそろえる。
+        /// ・画面で線を引いている辺（太さが0より大きい辺）だけを対象にし、すべて同じ太さにする
+        /// 　（画面ではヘッダー行のセル間の縦線だけ HEADER_VERTICAL_BORDER_THICKNESS で太いため、
+        /// 　そのまま書き出すとその線だけ太く見えていた）。
+        /// ・ヘッダー行の背景色は、書き出す間だけセルから行（TableRow）へ移す。セルの背景は
+        /// 　隣のセルの右辺の罫線に重なって描かれることがあり、ヘッダー行の縦線だけが消える
+        /// 　原因になっていた。行の背景はセルとその罫線より先（下）に描かれるため、罫線を隠さない。
+        /// 書き出し後は、戻り値の処理を呼んで元の罫線・背景に戻すこと。
+        /// </summary>
+        /// <param name="a_table">対象の表。</param>
+        /// <returns>元の罫線・背景に戻す処理。</returns>
+        public static Action ApplyPrintTableBorders(Table a_table)
+        {
+            var restores = new List<Action>();
+            Brush borderBrush = m_printTableBorder;
+
+            restores.Add(SaveLocalValue(a_table, Block.BorderBrushProperty));
+            restores.Add(SaveLocalValue(a_table, Block.BorderThicknessProperty));
+            a_table.BorderBrush = borderBrush;
+            a_table.BorderThickness = ToPrintBorderThickness(a_table.BorderThickness);
+
+            foreach (TableRowGroup rg in a_table.RowGroups)
+            {
+                foreach (TableRow row in rg.Rows)
+                {
+                    // 行のすべてのセルが同じ背景色を持つ（＝ヘッダー行）なら、背景を行へ移す。
+                    Brush rowBackground = null;
+                    if (0 < row.Cells.Count && null == row.Background)
+                    {
+                        Brush first = row.Cells[0].Background;
+                        if (null != first && row.Cells.All(c => ReferenceEquals(c.Background, first)))
+                        {
+                            rowBackground = first;
+                        }
+                    }
+                    if (null != rowBackground)
+                    {
+                        restores.Add(SaveLocalValue(row, TextElement.BackgroundProperty));
+                        row.Background = rowBackground;
+                    }
+
+                    foreach (TableCell cell in row.Cells)
+                    {
+                        restores.Add(SaveLocalValue(cell, TableCell.BorderBrushProperty));
+                        restores.Add(SaveLocalValue(cell, TableCell.BorderThicknessProperty));
+                        cell.BorderBrush = borderBrush;
+                        cell.BorderThickness = ToPrintBorderThickness(cell.BorderThickness);
+                        if (null != rowBackground)
+                        {
+                            restores.Add(SaveLocalValue(cell, TextElement.BackgroundProperty));
+                            cell.Background = null;
+                        }
+                    }
+                }
+            }
+
+            return () =>
+            {
+                for (int i = restores.Count - 1; i >= 0; i--)
+                {
+                    restores[i]();
+                }
+            };
+        }
+
+        /// <summary>線を引いている辺（0より大きい辺）だけを PRINT_TABLE_BORDER_THICKNESS にする。</summary>
+        /// <param name="a_thickness">画面用の太さ。</param>
+        /// <returns>PDF出力用の太さ。</returns>
+        private static Thickness ToPrintBorderThickness(Thickness a_thickness)
+        {
+            static double Side(double a_value) => 0 < a_value ? PRINT_TABLE_BORDER_THICKNESS : 0;
+            return new Thickness(Side(a_thickness.Left), Side(a_thickness.Top), Side(a_thickness.Right), Side(a_thickness.Bottom));
+        }
+
+        /// <summary>プロパティのローカル値を覚えておき、それに戻す処理を返す（値が未設定だった
+        /// 場合は、戻す時に未設定へ戻す）。</summary>
+        /// <param name="a_obj">対象。</param>
+        /// <param name="a_property">プロパティ。</param>
+        /// <returns>元に戻す処理。</returns>
+        private static Action SaveLocalValue(DependencyObject a_obj, DependencyProperty a_property)
+        {
+            object value = a_obj.ReadLocalValue(a_property);
+            return () =>
+            {
+                if (DependencyProperty.UnsetValue == value)
+                {
+                    a_obj.ClearValue(a_property);
+                }
+                else
+                {
+                    a_obj.SetValue(a_property, value);
+                }
+            };
+        }
+
+        // ======================================================================
+        //  表の列幅（内容に合わせたコンパクトな列幅）
+        // ======================================================================
+
+        /// <summary>エディタの表示フォント（既定）。Typoraの実際の描画フォント（Yu Gothic、
+        /// UI版ではない通常版）に合わせた設定。メニュー「表示」→「表示フォント」参照。</summary>
+        public static readonly FontFamily DefaultEditorFontFamily = new FontFamily("Meiryo, Segoe UI");
+
+        /// <summary>エディタの表示フォント（フォント変更前の以前の設定）。メニュー「表示」→
+        /// 「表示フォント」で切り替えられる。</summary>
+        public static readonly FontFamily LegacyEditorFontFamily = new FontFamily("Yu Gothic UI, Segoe UI");
+
+        /// <summary>表のセルの計測に使うフォント（MainWindow.xamlのFlowDocumentの設定と
+        /// 合わせてある）。メニュー「表示」→「表示フォント」の切り替えに応じて
+        /// SetTableMeasureFontFamilyで更新される。</summary>
+        private static FontFamily m_tableMeasureFontFamily = DefaultEditorFontFamily;
+        // 表のセルの計測に使う文字の大きさ（本文と同じ。表示スタイルで変わる）。
+        private static double TABLE_MEASURE_FONT_SIZE => BodyFontSize;
+
+        /// <summary>表のセル幅計測に使うフォントを変更する。メニュー「表示」→「表示フォント」の
+        /// 切り替え時にMainWindowから呼ばれる（表のセル自体の表示フォントは、FlowDocumentの
+        /// FontFamily変更がWPFの通常のプロパティ継承で自動的に反映されるため、ここでは計測用の
+        /// 値だけを更新すればよい）。</summary>
+        /// <param name="a_fontFamily">新しい計測用フォント。</param>
+        public static void SetTableMeasureFontFamily(FontFamily a_fontFamily)
+        {
+            m_tableMeasureFontFamily = a_fontFamily;
+        }
+
+        /// <summary>この幅（px）を超える内容を持つ列は固定幅にせず、残りの幅を分け合って
+        /// 折り返す列として扱う（ApplyContentBasedColumnWidths、現在は無効化）。
+        /// MeasureNaturalColumnWidthsPxが返す「内容の自然な幅」の上限としても流用している。
+        /// 長い説明文の列をこの上限で頭打ちにしないと、列幅の自動計算（BuildColumnWidthDialogInfo・
+        /// ApplyAutoCalculatedColumnWidths）でその列の比率が突出し、他の列が読めないほど
+        /// 狭く押しつぶされる（詳細はMeasureNaturalColumnWidthsPxのコメント参照）。</summary>
+        private const double TABLE_COLUMN_COMPACT_MAX_WIDTH = 300;
+
+        /// <summary>TableCellのPadding（左右合計）。列幅を内容ぴったりにする際、この分だけ
+        /// 上乗せする。</summary>
+        private static double TABLE_CELL_HORIZONTAL_PADDING => TableCellPadding.Left + TableCellPadding.Right;
+
+        /// <summary>
+        /// 自動計算した「内容にちょうど収まる幅」に、追加で確保しておく余裕（px）。
+        /// MeasureNaturalColumnWidthsPxの測定（FormattedTextによる文字列幅の計測＋
+        /// TABLE_CELL_HORIZONTAL_PADDING）には、セルの罫線の太さ（ApplyTableCellBordersで
+        /// 各セルの右辺に加える罫線。本文行1px・ヘッダー行はHEADER_VERTICAL_BORDER_THICKNESS
+        /// ＝1.75px）が含まれておらず、また環境のDPI等により実際の描画幅と測定値にごく
+        /// わずかな差が生じることがある。固定幅（Pixel）表示でこの差が足りないと、いちばん
+        /// 長い文字列の最後の1〜2文字だけ次の行へ折り返される不具合が実機で確認されたため、
+        /// この余裕を上乗せして防いでいる。
+        /// </summary>
+        private const double TABLE_COLUMN_WIDTH_SAFETY_MARGIN_PX = 8;
+
+        /// <summary>
+        /// 自動計算の列幅（ComputeAutoColumnWidthsPx）で、表示できる幅に合わせて列を広げる際、表の右端（最後の列の
+        /// 右辺の罫線。ApplyTableCellBorders参照）をavailableWidthPxぎりぎりまで使い切らず、
+        /// この分だけ手前で止めておく余裕（px）。ぴったりavailableWidthPxまで埋めてしまうと、
+        /// 測定値と実際の描画幅のわずかな差（DPIやレイアウトのタイミングによる）で表が
+        /// わずかにはみ出し、表の右端の罫線だけが編集領域の外側へ見切れて消えてしまう不具合が
+        /// 実機で確認されたため、この余裕を残して防いでいる。
+        /// </summary>
+        private const double TABLE_RIGHT_EDGE_SAFETY_MARGIN_PX = 8;
+
+        /// <summary>
+        /// 表の各列の幅を、実際のセル内容に合わせて設定する。WPFの既定のTable列幅
+        /// アルゴリズムは内容量に関わらず利用可能な幅いっぱいに広がるため、GitHub等の
+        /// 一般的なMarkdownビューアのような「短い列はコンパクトに、長い列だけ折り返す」
+        /// 見た目にはならない。各列の実際のセル文字列をFormattedTextで測定し、
+        /// TABLE_COLUMN_COMPACT_MAX_WIDTH以下に収まる列は内容ぴったりの固定幅（Pixel）へ、
+        /// 収まらない列は残りの幅を分け合うStar幅へ、それぞれ上書きする。呼び出し側は、
+        /// 表の行・セルをすべて組み立てた直後（内容が確定した後）に呼ぶこと。
+        /// 注：System.Windows.Documents.Table（FrameworkContentElement）には
+        /// HorizontalAlignmentプロパティが無いため、表全体を左揃えにする処理はここでは
+        /// 行っていない。
+        /// </summary>
+        /// <param name="a_table">対象の表（RowGroups・Rows・Cellsまで構築済みであること）。</param>
+        public static void ApplyContentBasedColumnWidths(Table a_table)
+        {
+            int colCount = a_table.Columns.Count;
+            if (0 == colCount)
+            {
+                return;
+            }
+
+            var maxWidths = new double[colCount];
+            foreach (TableRowGroup rg in a_table.RowGroups)
+            {
+                foreach (TableRow row in rg.Rows)
+                {
+                    for (int c = 0; c < row.Cells.Count && c < colCount; c++)
+                    {
+                        TableCell cell = row.Cells[c];
+                        string text = new TextRange(cell.ContentStart, cell.ContentEnd).Text?.Trim();
+                        if (string.IsNullOrEmpty(text))
+                        {
+                            continue;
+                        }
+                        var typeface = new Typeface(
+                            m_tableMeasureFontFamily, FontStyles.Normal, cell.FontWeight, FontStretches.Normal);
+                        var formatted = new FormattedText(
+                            text, CultureInfo.CurrentCulture, FlowDirection.LeftToRight, typeface,
+                            TABLE_MEASURE_FONT_SIZE, Brushes.Black, 1.0);
+                        if (formatted.Width > maxWidths[c])
+                        {
+                            maxWidths[c] = formatted.Width;
+                        }
+                    }
+                }
+            }
+
+            for (int c = 0; c < colCount; c++)
+            {
+                if (maxWidths[c] <= 0)
+                {
+                    continue; // 空列は既定のまま（Autoに近い挙動）にしておく
+                }
+                double compactWidth = maxWidths[c] + TABLE_CELL_HORIZONTAL_PADDING;
+                if (compactWidth <= TABLE_COLUMN_COMPACT_MAX_WIDTH)
+                {
+                    a_table.Columns[c].Width = new GridLength(compactWidth, GridUnitType.Pixel);
+                }
+                else
+                {
+                    a_table.Columns[c].Width = new GridLength(1, GridUnitType.Star);
+                }
+            }
+        }
+
+        // ======================================================================
+        //  表の列幅（ダイアログでの手動調整・ステップ2）
+        // ======================================================================
+
+        /// <summary>列幅を「区切り行のダッシュ（-）の数」で表す際の既定値（未調整の列）。
+        /// MarkdownConverterが生成する区切り行（"---"等）のダッシュ数と一致させてある。</summary>
+        public const int TABLE_COLUMN_DEFAULT_DASH_COUNT = 3;
+
+        /// <summary>列幅として指定できるダッシュ数の下限・上限。区切り行として意味を持つ
+        /// 最小値（3）を下限とし、上限は極端に長い区切り行になり過ぎないよう抑える。</summary>
+        public const int TABLE_COLUMN_MIN_DASH_COUNT = 3;
+        public const int TABLE_COLUMN_MAX_DASH_COUNT = 60;
+
+        /// <summary>列の内容が空の場合に使う、既定の列幅（px）。</summary>
+        public const double DEFAULT_NATURAL_COLUMN_WIDTH_PX = 80;
+
+        /// <summary>
+        /// 「ダッシュ1個ぶんの幅」として使う基準値（px）。m_tableMeasureFontFamily・
+        /// TABLE_MEASURE_FONT_SIZEで半角文字1つ（"0"）を測定した幅を基準にしている。
+        /// これにより、ダイアログでの「幅の数値」が、おおよそ「その文字数ぶんの半角文字が
+        /// 入る幅」という感覚に近くなる。
+        /// </summary>
+        private static double DashUnitWidthPx()
+        {
+            var typeface = new Typeface(m_tableMeasureFontFamily, FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
+            var formatted = new FormattedText(
+                "0", CultureInfo.CurrentCulture, FlowDirection.LeftToRight, typeface,
+                TABLE_MEASURE_FONT_SIZE, Brushes.Black, GetMeasurementPixelsPerDip());
+            return formatted.Width;
+        }
+
+        /// <summary>FormattedTextでの文字列幅測定に使う、実際の画面のPixelsPerDip（1デバイス
+        /// 非依存ピクセルあたりの実ピクセル数。DPI拡大率に対応する値で、100%なら1.0、
+        /// 125%なら1.25等）を取得する。
+        /// 以前はこの値を常に1.0固定で渡していたが、Windowには既定でUseLayoutRounding="True"
+        /// （MainWindow.xaml）が設定されており、実際の描画ではこのPixelsPerDipに基づいて
+        /// 文字の送り幅がデバイスピクセル単位に丸められる。拡大率が100%でない環境（Windowsの
+        /// 既定設定で多い125%・150%等）では、1.0固定で測定した幅と実際の描画幅がわずかに
+        /// ずれ、そのずれが1行の文字数ぶん積み重なることで、列幅としては足りているはずの
+        /// セルで単語単位の折り返しが発生する不具合の原因になっていた。
+        /// メインウィンドウ（Visual）から実際のPixelsPerDipを取得し、取得できない場合
+        /// （アプリ起動前後の一時的な文書など）は安全側として1.0にフォールバックする。</summary>
+        private static double GetMeasurementPixelsPerDip()
+        {
+            Window mainWindow = Application.Current?.MainWindow;
+            if (null == mainWindow)
+            {
+                return 1.0;
+            }
+            try
+            {
+                return VisualTreeHelper.GetDpi(mainWindow).PixelsPerDip;
+            }
+            catch (InvalidOperationException)
+            {
+                // まだ画面に表示されていない（PresentationSourceが無い）場合はここに来る。
+                return 1.0;
+            }
+        }
+
+        /// <summary>ダッシュ数（列幅調整ダイアログ・Markdownの区切り行の両方で使う単位）を、
+        /// 有効な範囲（TABLE_COLUMN_MIN_DASH_COUNT〜TABLE_COLUMN_MAX_DASH_COUNT）に収める。</summary>
+        /// <param name="a_count">ダッシュ数。</param>
+        public static int ClampDashCount(int a_count)
+        {
+            if (a_count < TABLE_COLUMN_MIN_DASH_COUNT)
+            {
+                return TABLE_COLUMN_MIN_DASH_COUNT;
+            }
+            if (a_count > TABLE_COLUMN_MAX_DASH_COUNT)
+            {
+                return TABLE_COLUMN_MAX_DASH_COUNT;
+            }
+            return a_count;
+        }
+
+        /// <summary>
+        /// 列ごとの区切り行のダッシュ数から、その表が「列幅調整ダイアログで明示的に調整された
+        /// もの」かどうかを判定する。すべての列のダッシュ数が互いに同じであれば、既定値
+        /// （3個＝|---|）ちょうどでなくても「未調整（自動計算のままでよい）」とみなす。
+        /// 手書きのMarkdownや他のエディタでは、列幅を意図して調整したわけではなく、単に
+        /// 見た目を整えるために区切り行のダッシュを（全列そろえて）3個より多く書くことが
+        /// よくある。そうしたファイルを開いた際まで「調整済み」として毎回編集領域いっぱいの
+        /// 幅（Star比率）にしてしまうと、意図しない見た目になってしまうため、列ごとに
+        /// ダッシュ数が異なる場合だけを、ダイアログで個別に比率を指定したものとみなす。
+        /// 列が1つしかない表は、常に「未調整」として扱う（列が1つだけならダッシュ数の値に
+        /// 意味を持たせようがないため）。
+        /// </summary>
+        /// <param name="a_dashCounts">列ごとの区切り行のダッシュ数。</param>
+        private static bool IsAutoCalculatedDashCounts(IReadOnlyList<int> a_dashCounts)
+        {
+            if (null == a_dashCounts || a_dashCounts.Count <= 1)
+            {
+                return true;
+            }
+            int first = a_dashCounts[0];
+            return a_dashCounts.All(d => first == d);
+        }
+
+        /// <summary>ピクセル幅（実際のセル内容から測った、まだ調整されていない列の幅）を、
+        /// ダッシュ数と同じ「単位」の数値に変換する（列幅調整ダイアログに現在値を表示する際、
+        /// および調整済みの列と比率を揃える際に使う。DashUnitWidthPxを1単位とする）。</summary>
+        /// <param name="a_pixelWidth">ピクセル幅。</param>
+        public static int PixelWidthToDashCount(double a_pixelWidth)
+        {
+            double unit = DashUnitWidthPx();
+            int count = (int)Math.Round((a_pixelWidth - TABLE_CELL_HORIZONTAL_PADDING) / unit, MidpointRounding.AwayFromZero);
+            return ClampDashCount(count);
+        }
+
+        /// <summary>
+        /// 1つのセルの内容を、実際に使われているRunごとのフォント（太字・インラインコード等の
+        /// 装飾で明示的に指定されているフォントファミリー・サイズ・太さ）を反映して測定し、
+        /// 幅（px）を返す。
+        /// 以前は、Runごとに別々のFormattedTextで個別に幅を測定し、それを単純に足し算して
+        /// いた。しかしWPFが実際に1行を描画する際は、複数のRunを1つながりの文字列として
+        /// レイアウト（シェーピング）するため、文字どうしの間隔（特に日本語と半角英数字が
+        /// 隣り合う境界）のつき方が、Runごとに切り離して測った幅の単純合計よりも広くなる
+        /// ことがある。通常の文章とインラインコード（`Shift+Ctrl+N`等。Consolas・14.72px。
+        /// AppendStyledRunsWithLineBreaks参照）のように複数のRunが混在するセルほどこの
+        /// 誤差が積み重なりやすく、「列幅としては計算上ぴったり収まっているはずなのに、
+        /// 実際の表示ではそのセルだけ折り返される（＝他の列や表の右側には余白が残る）」という
+        /// 不具合の原因になっていた（TABLE_COLUMN_WIDTH_SAFETY_MARGIN_PXの8pxだけでは
+        /// 吸収しきれないケースが実機で確認された）。
+        /// この誤差を避けるため、1つの段落のRun列をいったん1本の文字列へ連結し、単一の
+        /// FormattedTextとして測定した上で、既定（m_tableMeasureFontFamily・
+        /// TABLE_MEASURE_FONT_SIZE・セルのFontWeight）と異なるRun（インラインコード等）の
+        /// 区間だけSetFontFamily/SetFontSize/SetFontWeightで部分的に上書きする。これにより、
+        /// 実際の描画と同じ「1行としてのシェーピング」を再現した幅が得られる。
+        /// 各Runは、ローカルに設定されたFontFamily/FontSize/FontWeightがあればそれを使い、
+        /// 無ければセルの既定を使う（ローカル値の有無で判定するのは、まだFlowDocumentに
+        /// 組み込まれる前のRunでも、親子関係に左右されず同じ結果を得るため）。
+        /// </summary>
+        /// <param name="a_cell">対象のセル。</param>
+        private static double MeasureCellContentWidthPx(TableCell a_cell)
+        {
+            FontFamily defaultFamily = m_tableMeasureFontFamily;
+            double defaultSize = TABLE_MEASURE_FONT_SIZE;
+            FontWeight defaultWeight = a_cell.FontWeight;
+
+            double maxParaWidth = 0;
+            foreach (Block block in a_cell.Blocks)
+            {
+                if (!(block is Paragraph p))
+                {
+                    continue;
+                }
+
+                var sb = new StringBuilder();
+                var ranges = new List<(int Start, int Length, FontFamily Family, double Size, FontWeight Weight)>();
+
+                foreach (Inline inline in p.Inlines)
+                {
+                    // セルの画像（InlineUIContainerで包まれたImage）は、列幅の自動計算には
+                    // 含めない（テキストの内容量だけで列幅を決める）。画像は、この計算で
+                    // 確定した列幅に収まるよう、後段のConstrainCellImagesToColumnWidthsで
+                    // 別途縮小する。ここで画像の表示幅を列幅計算に含めてしまうと、画像1枚の
+                    // ためだけに列（表全体）が編集領域を超えて広がってしまう。
+                    if (inline is InlineUIContainer iuc && iuc.Child is Image)
+                    {
+                        continue;
+                    }
+                    if (!(inline is Run run))
+                    {
+                        continue;
+                    }
+                    string text = run.Text;
+                    if (string.IsNullOrEmpty(text))
+                    {
+                        continue;
+                    }
+                    FontFamily fontFamily = DependencyProperty.UnsetValue != run.ReadLocalValue(TextElement.FontFamilyProperty)
+                        ? run.FontFamily : defaultFamily;
+                    double fontSize = DependencyProperty.UnsetValue != run.ReadLocalValue(TextElement.FontSizeProperty)
+                        ? run.FontSize : defaultSize;
+                    FontWeight fontWeight = DependencyProperty.UnsetValue != run.ReadLocalValue(TextElement.FontWeightProperty)
+                        ? run.FontWeight : defaultWeight;
+
+                    int start = sb.Length;
+                    sb.Append(text);
+                    ranges.Add((start, text.Length, fontFamily, fontSize, fontWeight));
+                }
+
+                if (0 == sb.Length)
+                {
+                    continue;
+                }
+
+                var baseTypeface = new Typeface(defaultFamily, FontStyles.Normal, defaultWeight, FontStretches.Normal);
+                var formatted = new FormattedText(
+                    sb.ToString(), CultureInfo.CurrentCulture, FlowDirection.LeftToRight, baseTypeface,
+                    defaultSize, Brushes.Black, GetMeasurementPixelsPerDip());
+
+                foreach (var r in ranges)
+                {
+                    // 既定値と同じ区間はそのまま（ベースのTypeface設定を使う）にし、異なる
+                    // 区間（インラインコード等）だけ明示的に上書きする。
+                    if (!r.Family.Equals(defaultFamily))
+                    {
+                        formatted.SetFontFamily(r.Family, r.Start, r.Length);
+                    }
+                    if (Math.Abs(r.Size - defaultSize) > 0.01)
+                    {
+                        formatted.SetFontSize(r.Size, r.Start, r.Length);
+                    }
+                    if (r.Weight != defaultWeight)
+                    {
+                        formatted.SetFontWeight(r.Weight, r.Start, r.Length);
+                    }
+                }
+
+                if (formatted.Width > maxParaWidth)
+                {
+                    maxParaWidth = formatted.Width;
+                }
+            }
+            return maxParaWidth;
+        }
+
+        /// <summary>各列の実際のセル内容から、「内容にちょうど収まる幅」を、頭打ち・余裕を
+        /// 加える前の生の値（px。セルのPadding分は含む）として測る。MeasureNaturalColumnWidthsPx
+        /// （Star比率で使う、頭打ち・余裕あり版）とMeasureUncappedColumnWidthsPx（Pixelで使う、
+        /// 頭打ち無し・余裕あり版）の両方が、この共通の測定処理を経由する。</summary>
+        /// <param name="a_table">対象の表。</param>
+        private static double[] MeasureRawColumnContentWidthsPx(Table a_table)
+        {
+            int colCount = a_table.Columns.Count;
+            var widths = new double[colCount];
+            foreach (TableRowGroup rg in a_table.RowGroups)
+            {
+                foreach (TableRow row in rg.Rows)
+                {
+                    for (int c = 0; c < row.Cells.Count && c < colCount; c++)
+                    {
+                        double cellWidth = MeasureCellContentWidthPx(row.Cells[c]);
+                        if (cellWidth > widths[c])
+                        {
+                            widths[c] = cellWidth;
+                        }
+                    }
+                }
+            }
+            for (int c = 0; c < colCount; c++)
+            {
+                widths[c] = widths[c] <= 0 ? DEFAULT_NATURAL_COLUMN_WIDTH_PX : widths[c] + TABLE_CELL_HORIZONTAL_PADDING;
+            }
+            return widths;
+        }
+
+        /// <summary>各列の実際のセル内容から、内容にちょうど収まる幅（px）を測る
+        /// （ApplyContentBasedColumnWidthsの測定部分と同じ考え方だが、Star幅の統一方針で
+        /// 使うための独立した測定ヘルパー。詳細はApplyExplicitColumnWidthsのコメント参照）。
+        /// 長い説明文の列をそのままの幅にすると、Star（比率）で他の列を圧迫して読めない
+        /// ほど狭く押しつぶす不具合があったため、TABLE_COLUMN_COMPACT_MAX_WIDTHで頭打ちに
+        /// している（長い列同士はおおむね同じ比率になり、それぞれの中で複数行に折り返す）。
+        /// Pixel（固定幅。他の列と幅を奪い合わない）で使う場合はこの頭打ちを適用しない
+        /// （MeasureUncappedColumnWidthsPx参照）。頭打ち後の幅には、罫線の太さやDPI差を
+        /// 吸収するための余裕（TABLE_COLUMN_WIDTH_SAFETY_MARGIN_PX）も上乗せする。</summary>
+        /// <param name="a_table">対象の表。</param>
+        private static double[] MeasureNaturalColumnWidthsPx(Table a_table)
+        {
+            var raw = MeasureRawColumnContentWidthsPx(a_table);
+            var widths = new double[raw.Length];
+            for (int c = 0; c < raw.Length; c++)
+            {
+                widths[c] = Math.Min(raw[c], TABLE_COLUMN_COMPACT_MAX_WIDTH) + TABLE_COLUMN_WIDTH_SAFETY_MARGIN_PX;
+            }
+            return widths;
+        }
+
+        /// <summary>
+        /// 各列の実際のセル内容から、内容にちょうど収まる幅（px）を、TABLE_COLUMN_COMPACT_
+        /// MAX_WIDTHでの頭打ちを行わずに測る（余裕（TABLE_COLUMN_WIDTH_SAFETY_MARGIN_PX）は
+        /// 加える）。300pxの頭打ちは、Star（比率）方式で複数列が幅を奪い合う場合に1つの
+        /// 長い列が比率の大半を占めて他の列を圧迫するのを防ぐためのものであり、Pixel
+        /// （固定幅、他の列と幅を奪い合わない）方式にまで適用すると、表全体には余裕が
+        /// あるのに頭打ちされた列だけが不要な折り返しをする不具合になる。
+        /// ApplyAutoCalculatedColumnWidthsは、この頭打ち無しの幅の合計が表示可能幅に
+        /// 収まる場合にだけPixelを使うため、他の列を圧迫する心配が無い。
+        /// </summary>
+        /// <param name="a_table">対象の表。</param>
+        private static double[] MeasureUncappedColumnWidthsPx(Table a_table)
+        {
+            var raw = MeasureRawColumnContentWidthsPx(a_table);
+            var widths = new double[raw.Length];
+            for (int c = 0; c < raw.Length; c++)
+            {
+                widths[c] = raw[c] + TABLE_COLUMN_WIDTH_SAFETY_MARGIN_PX;
+            }
+            return widths;
+        }
+
+        /// <summary>
+        /// 表のインスタンスごとに、「区切り行のダッシュ数（＝Markdownソースへ実際に保存される
+        /// べき値）」を覚えておくための、表示用の列幅（TableColumn.Width）とは独立した記録先。
+        /// 表インスタンスをキーにした<see cref="ConditionalWeakTable{TKey, TValue}"/>で、
+        /// 表が破棄されれば一緒にGCされる（明示的な削除処理は不要）。
+        /// メニュー「列幅を補正する」がオフの間は、表の見た目を既定の均等幅（Auto）に戻す
+        /// （<see cref="ApplyEffectiveColumnWidths"/>参照）。もし保存処理（MarkdownConverter.
+        /// TableToMarkdown）が表示用のTableColumn.Widthだけを見てダッシュ数を判断すると、
+        /// トグルがオフの間に保存した際、調整済みだった表の情報が既定値（|---|）で失われて
+        /// しまう。そこで、保存されるべき「本当の値」はこの記録先で表示用の列幅とは別に
+        /// 管理し、TableToMarkdownは常にここを参照する。
+        /// </summary>
+        private static readonly ConditionalWeakTable<Table, int[]> m_sourceDashCounts =
+            new ConditionalWeakTable<Table, int[]>();
+
+        /// <summary>表の、区切り行へ実際に保存されるべきダッシュ数を記録する（既存の記録が
+        /// あれば置き換える）。MarkdownConverter.MarkdownToDocumentでの新規解析時（ソースから
+        /// そのまま）と、TableEditor.ApplyColumnWidths（ダイアログでの変更確定時）の両方から
+        /// 呼ばれる。</summary>
+        /// <param name="a_table">対象の表。</param>
+        /// <param name="a_dashCounts">列ごとのダッシュ数。</param>
+        public static void SetSourceDashCounts(Table a_table, IReadOnlyList<int> a_dashCounts)
+        {
+            m_sourceDashCounts.Remove(a_table);
+            m_sourceDashCounts.Add(a_table, a_dashCounts.ToArray());
+        }
+
+        /// <summary>表の、区切り行へ実際に保存されるべきダッシュ数を取得する。一度も
+        /// SetSourceDashCountsが呼ばれていない表（挿入直後でまだ未調整の表など）はnullを返す
+        /// （呼び出し側は、nullなら「すべて既定値」として扱うこと）。</summary>
+        /// <param name="a_table">対象の表。</param>
+        public static IReadOnlyList<int> GetSourceDashCounts(Table a_table)
+        {
+            return m_sourceDashCounts.TryGetValue(a_table, out var counts) ? counts : null;
+        }
+
+        /// <summary>列の挿入（TableEditor.InsertColumn）に合わせて、記録済みのダッシュ数一覧に
+        /// 既定値の要素を1つ挿入する。まだ記録が無い表（一度も調整されていない表）には何もしない
+        /// （記録が無いこと自体が「すべて既定値」を意味するため、そのままで整合する）。</summary>
+        /// <param name="a_table">対象の表。</param>
+        /// <param name="a_index">新しい列の挿入位置（0始まり）。</param>
+        public static void InsertIntoSourceDashCounts(Table a_table, int a_index)
+        {
+            if (!m_sourceDashCounts.TryGetValue(a_table, out var counts))
+            {
+                return;
+            }
+            var list = counts.ToList();
+            int idx = Math.Max(0, Math.Min(a_index, list.Count));
+            list.Insert(idx, TABLE_COLUMN_DEFAULT_DASH_COUNT);
+            m_sourceDashCounts.Remove(a_table);
+            m_sourceDashCounts.Add(a_table, list.ToArray());
+        }
+
+        /// <summary>列の削除（TableEditor.DeleteColumn）に合わせて、記録済みのダッシュ数一覧から
+        /// 該当する要素を1つ取り除く。まだ記録が無い表には何もしない（InsertIntoSourceDashCounts
+        /// と同じ理由）。</summary>
+        /// <param name="a_table">対象の表。</param>
+        /// <param name="a_index">削除する列の位置（0始まり）。</param>
+        public static void RemoveFromSourceDashCounts(Table a_table, int a_index)
+        {
+            if (!m_sourceDashCounts.TryGetValue(a_table, out var counts))
+            {
+                return;
+            }
+            var list = counts.ToList();
+            if (a_index < 0 || a_index >= list.Count)
+            {
+                return;
+            }
+            list.RemoveAt(a_index);
+            m_sourceDashCounts.Remove(a_table);
+            m_sourceDashCounts.Add(a_table, list.ToArray());
+        }
+
+        /// <summary>
+        /// 列幅調整ダイアログの初期表示用に、表の列ごとのラベル（見出しセルの文字列）と
+        /// 現在の幅（ダッシュ数換算）、および「自動計算」チェックボックスの初期状態を組み立てる。
+        /// 表がまだ調整されていない（GetSourceDashCountsがnull、または全列のダッシュ数が
+        /// 互いに同じ。詳細はIsAutoCalculatedDashCountsのコメント参照）場合は、実際の内容から
+        /// 測った幅をダッシュ数と同じ単位に変換した値と、IsAutoCalculated=trueを返す。すでに
+        /// 明示的な幅（列によって異なるダッシュ数）が記録されている場合は、その値と
+        /// IsAutoCalculated=falseを返す（自動計算か否かは表全体で1つの状態であり、列ごとには
+        /// 分けない。ApplyExplicitColumnWidthsが常に全列を同じ扱いにする方針と揃えてある）。
+        /// </summary>
+        /// <param name="a_table">対象の表。</param>
+        public static (List<string> Labels, List<int> DashCounts, bool IsAutoCalculated) BuildColumnWidthDialogInfo(
+            Table a_table, double? a_availableWidthPx = null)
+        {
+            var labels = new List<string>();
+            var dashCounts = new List<int>();
+            int colCount = a_table.Columns.Count;
+            // 自動計算の値：実際に表示している列幅（ComputeAutoColumnWidthsPx）。表示できる幅が分からない時は、
+            // 内容から測った幅（頭打ちあり）
+            var naturalWidths = ComputeAutoColumnWidthsPx(a_table, a_availableWidthPx) ?? MeasureNaturalColumnWidthsPx(a_table);
+
+            var sourceDashCounts = GetSourceDashCounts(a_table);
+            bool isAutoCalculatedFlg = IsAutoCalculatedDashCounts(sourceDashCounts);
+
+            TableRow headerRow = null;
+            foreach (TableRowGroup rg in a_table.RowGroups)
+            {
+                foreach (TableRow row in rg.Rows)
+                {
+                    headerRow = row;
+                    break;
+                }
+                break;
+            }
+
+            for (int c = 0; c < colCount; c++)
+            {
+                string label = "";
+                if (null != headerRow && c < headerRow.Cells.Count)
+                {
+                    label = new TextRange(headerRow.Cells[c].ContentStart, headerRow.Cells[c].ContentEnd).Text?.Trim() ?? "";
+                }
+                labels.Add(label);
+
+                int dashCount;
+                if (isAutoCalculatedFlg)
+                {
+                    // 自動計算の場合は、常にその場の内容から測り直した値を表示する（表示中に
+                    // 内容が変わっていた場合も最新の内容に基づく比率になるようにするため）。
+                    dashCount = PixelWidthToDashCount(c < naturalWidths.Length ? naturalWidths[c] : DEFAULT_NATURAL_COLUMN_WIDTH_PX);
+                }
+                else
+                {
+                    dashCount = ClampDashCount(c < sourceDashCounts.Count ? sourceDashCounts[c] : TABLE_COLUMN_DEFAULT_DASH_COUNT);
+                }
+                dashCounts.Add(dashCount);
+            }
+            return (labels, dashCounts, isAutoCalculatedFlg);
+        }
+
+        /// <summary>
+        /// 表の各列に、明示的に指定された比率（ダッシュ数）に基づく列幅を設定する。
+        /// ApplyAutoCalculatedColumnWidths（未調整の表）と同じ2段階の方針を取る。
+        /// まず、各列のダッシュ数をpx単位に換算した幅（<paramref name="a_dashCounts"/>が
+        /// nullの列は、その列の実際の内容から測った、頭打ち無しの幅）の合計が
+        /// <paramref name="a_availableWidthPx"/>に収まる場合は、他の列と幅を奪い合わない
+        /// Pixel（固定px）で、その換算幅そのままを設定する（指定した比率を保ちつつ、
+        /// 内容量に見合ったコンパクトな見た目になる）。
+        /// 収まらない場合、または<paramref name="a_availableWidthPx"/>が不明（null）な
+        /// 場合は、従来通りStar（Gridの ColumnDefinitionと同様の比率指定）で、ダッシュ数を
+        /// そのまま比率として使う。表の合計幅が編集領域の横幅を超えると右端が見切れて読めなく
+        /// なり、WPFのRichTextBoxは既定で横スクロールできないため、絶対px指定はウインドウを
+        /// 狭くすると再発する問題を抱えていた。Star幅なら表全体の横幅を比率で分け合うため、
+        /// 編集領域を超えることが構造上あり得ない。
+        /// なお、WPFの<see cref="Table"/>の列幅はPixel・Star・Auto（既定値）を混在させると
+        /// 意図と逆の見た目になることが確認されているため（ApplyContentBasedColumnWidths
+        /// のコメント参照）、いずれの段階でも対象の表の全列を例外なく同じ単位（Pixelなら
+        /// 全列Pixel、Starなら全列Star）にする方針を維持している。
+        /// <paramref name="a_dashCounts"/>で値が指定されている（nullでない）列は、その
+        /// ダッシュ数をそのまま比率として使う。値が指定されていない（null）列は、その列の
+        /// 実際の内容から測った幅をダッシュ数と同じ単位に変換した上で比率として使う
+        /// （ユーザーが調整していない列まで、無関係に極端に狭くなってしまわないように
+        /// するため）。
+        /// </summary>
+        /// <param name="a_table">対象の表。</param>
+        /// <param name="a_dashCounts">列ごとの新しい値（ダッシュ数＝比率）。列の順序と
+        /// 一致させること。nullの要素は「この列は調整しない（内容に合わせた比率のままにする）」
+        /// を意味する。</param>
+        /// <param name="a_availableWidthPx">表を表示できる実際の幅（px）。コンパクトな
+        /// 固定幅（Pixel）にできるかどうかの判断と、Star列に含まれる画像を実際に表示される
+        /// 幅の概算に収まるよう縮小する際（ConstrainCellImagesToColumnWidths参照）の両方に
+        /// 使う。呼び出し側が把握していない場合はnull（その場合は常にStar比率にする。Star列の
+        /// 画像も縮小の対象外とする）。</param>
+        public static void ApplyExplicitColumnWidths(Table a_table, IReadOnlyList<int?> a_dashCounts, double? a_availableWidthPx = null)
+        {
+            int colCount = a_table.Columns.Count;
+            double unitPx = DashUnitWidthPx();
+            var uncappedNaturalWidths = MeasureUncappedColumnWidthsPx(a_table);
+
+            // Pixel候補の幅（頭打ち無し。他の列と幅を奪い合わないため）。
+            var pixelCandidateWidths = new double[colCount];
+            for (int c = 0; c < colCount; c++)
+            {
+                int? dashCount = c < a_dashCounts.Count ? a_dashCounts[c] : null;
+                pixelCandidateWidths[c] = dashCount.HasValue
+                    ? ClampDashCount(dashCount.Value) * unitPx + TABLE_CELL_HORIZONTAL_PADDING
+                    : (c < uncappedNaturalWidths.Length ? uncappedNaturalWidths[c] : DEFAULT_NATURAL_COLUMN_WIDTH_PX);
+            }
+
+            if (a_availableWidthPx.HasValue && pixelCandidateWidths.Sum() <= a_availableWidthPx.Value)
+            {
+                for (int c = 0; c < colCount; c++)
+                {
+                    a_table.Columns[c].Width = new GridLength(pixelCandidateWidths[c], GridUnitType.Pixel);
+                }
+                ConstrainCellImagesToColumnWidths(a_table, a_availableWidthPx);
+                return;
+            }
+
+            // Star比率へフォールバックする場合は、複数列が幅を奪い合うため頭打ちした幅を使う
+            // （ApplyAutoCalculatedColumnWidthsのStarフォールバックと同じ考え方）。
+            var cappedNaturalWidths = MeasureNaturalColumnWidthsPx(a_table);
+            for (int c = 0; c < colCount; c++)
+            {
+                int? dashCount = c < a_dashCounts.Count ? a_dashCounts[c] : null;
+                int starValue = dashCount.HasValue
+                    ? ClampDashCount(dashCount.Value)
+                    : PixelWidthToDashCount(c < cappedNaturalWidths.Length ? cappedNaturalWidths[c] : DEFAULT_NATURAL_COLUMN_WIDTH_PX);
+                a_table.Columns[c].Width = new GridLength(starValue, GridUnitType.Star);
+            }
+            ConstrainCellImagesToColumnWidths(a_table, a_availableWidthPx);
+        }
+
+        /// <summary>
+        /// まだ調整されていない表（区切り行のダッシュ数が全列とも互いに同じ。詳細は
+        /// IsAutoCalculatedDashCountsのコメント参照）に対して、列幅調整ダイアログの
+        /// 「自動計算」欄と同じ計算方法で、表示上だけ列幅を適用する。あくまで表示（TableColumn.Width）
+        /// だけの効果であり、区切り行のダッシュ数（GetSourceDashCounts／SetSourceDashCounts）には
+        /// 一切触れない。そのため、Markdownへの書き出し（MarkdownConverter.TableToMarkdown）
+        /// はこの比率を書き戻さず、区切り行のダッシュ数はそれまで記録されていた値
+        /// （手書きのMarkdownを読み込んだ場合はそのソースの値、既定値のまま一度も
+        /// 調整していない場合は既定値|---|）のまま保たれる。
+        /// 列幅は、ブラウザ（mdew・mdee）の表の自動レイアウトと同じ計算で決め、全列Pixel（固定px）に
+        /// する（ComputeAutoColumnWidthsPx参照。単位の混在は発生しない）。
+        /// <paramref name="a_availableWidthPx"/>がnull（呼び出し側が表示領域の幅を把握していない場合。
+        /// 保存専用の使い捨て文書など）や、列が多すぎて各列の最小の幅でも収まらない場合は、Star比率に
+        /// する（表が編集領域の横幅を超えて右端が見切れることが構造上あり得ないようにするための安全策）。
+        /// </summary>
+        /// <param name="a_table">対象の表。</param>
+        /// <param name="a_availableWidthPx">表を表示できる実際の幅（px）。呼び出し側が
+        /// 把握していない場合はnull（その場合は常にStar比率にする）。</param>
+        public static void ApplyAutoCalculatedColumnWidths(Table a_table, double? a_availableWidthPx)
+        {
+            int colCount = a_table.Columns.Count;
+            // ブラウザ（mdew・mdee）の表の自動レイアウトと同じ計算で、各列の幅（px）を決める
+            // （ComputeAutoColumnWidthsPx参照）。決められた時は、全列Pixel（固定px）にする。
+            var autoWidths = ComputeAutoColumnWidthsPx(a_table, a_availableWidthPx);
+            if (null != autoWidths)
+            {
+                for (int c = 0; c < colCount; c++)
+                {
+                    a_table.Columns[c].Width = new GridLength(autoWidths[c], GridUnitType.Pixel);
+                }
+                ConstrainCellImagesToColumnWidths(a_table, a_availableWidthPx);
+                return;
+            }
+
+            // 表示できる幅が分からない時（保存専用の使い捨て文書等）や、列が多すぎて各列の最小の幅でも
+            // 収まらない時だけ、複数列が幅を奪い合うStar比率へフォールバックする（頭打ちした幅を
+            // そのまま比率として使う）。
+            var naturalWidths = MeasureNaturalColumnWidthsPx(a_table);
+            var dashCounts = new List<int?>();
+            for (int c = 0; c < colCount; c++)
+            {
+                double px = c < naturalWidths.Length ? naturalWidths[c] : DEFAULT_NATURAL_COLUMN_WIDTH_PX;
+                dashCounts.Add(PixelWidthToDashCount(px));
+            }
+            ApplyExplicitColumnWidths(a_table, dashCounts, a_availableWidthPx);
+        }
+
+        /// <summary>
+        /// 自動計算の列で、各列が最低限確保する幅（px）。セルの左右の余白と、全角1文字分の幅と、罫線（1px）。
+        /// ブラウザ（mdew・mdee の「編集ペインの幅に合わせる」）で、セルの中の長い URL 等も途中で折り返す時の、
+        /// 列の最小の幅（1文字＋余白＋罫線。Chromium で測ると 37px）と同じ。
+        /// </summary>
+        private static double TABLE_AUTO_COLUMN_MIN_WIDTH_PX =>
+            TABLE_CELL_HORIZONTAL_PADDING + TABLE_MEASURE_FONT_SIZE + TABLE_CELL_BORDER_PX;
+
+        /// <summary>表のセルの罫線の太さ（px。ブラウザの列の幅には、罫線の分も含まれる）。</summary>
+        private const double TABLE_CELL_BORDER_PX = 1;
+
+        /// <summary>
+        /// まだ調整されていない表の各列の幅（px）を、ブラウザ（mdew・mdee）の表の自動レイアウトと
+        /// 同じ考え方で決める（3つのアプリで、同じ表がおおむね同じ列幅で表示されるように）。
+        ///  - 各列の「最大の幅」：セルの内容を折り返さずに並べた時の幅（MeasureUncappedColumnWidthsPx）。
+        ///  - 各列の「最小の幅」：TABLE_AUTO_COLUMN_MIN_WIDTH_PX（1文字分。mdew・mdee の「編集ペインの幅に合わせる」の
+        ///    表は、セルの中の語・URL をどこでも折り返せる（overflow-wrap: anywhere）ため、ブラウザでも1文字分になる。
+        ///    Chromium で実際に測って確かめた）。
+        ///  - 最大の幅の合計が表示できる幅に収まる時：各列を最大の幅にする（短い表は内容に合わせて
+        ///    コンパクトに表示する）。
+        ///  - 収まらない時：各列に最小の幅を配った上で、残りの幅を「最大の幅 − 最小の幅」の比で配る
+        ///    （Chromium の表の自動レイアウトの計算。内容の多い列ほど広くなるが、短い列も読める幅を
+        ///    保つ）。以前の計算（長い列を300pxで頭打ちにした幅の比）では、説明文の長い列が他の列と
+        ///    同じ扱いになり、ブラウザと見た目が大きく違っていた。
+        /// 表の右端の罫線が見切れないよう、表示できる幅から TABLE_RIGHT_EDGE_SAFETY_MARGIN_PX を
+        /// 残す。表示できる幅が分からない時、および最小の幅の合計でも収まらない時はnullを返す
+        /// （呼び出し側がStar比率にする）。
+        /// </summary>
+        /// <param name="a_table">対象の表。</param>
+        /// <param name="a_availableWidthPx">表を表示できる実際の幅（px）。分からない時はnull。</param>
+        /// <returns>各列の幅（px）。決められない時はnull。</returns>
+        public static double[] ComputeAutoColumnWidthsPx(Table a_table, double? a_availableWidthPx)
+        {
+            if (!a_availableWidthPx.HasValue || 0 == a_table.Columns.Count)
+            {
+                return null;
+            }
+            var maxWidths = MeasureUncappedColumnWidthsPx(a_table);
+            if (maxWidths.Sum() <= a_availableWidthPx.Value)
+            {
+                return maxWidths;
+            }
+            double targetWidthPx = a_availableWidthPx.Value - TABLE_RIGHT_EDGE_SAFETY_MARGIN_PX;
+            // 配る時の「最大の幅」は、ブラウザと同じく、余裕（TABLE_COLUMN_WIDTH_SAFETY_MARGIN_PX。折り返さずに収める時に、
+            // 最後の文字が次の行へ送られないためのもの）を足さない幅（内容＋余白＋罫線）にする（余裕を足すと、内容の短い列
+            // ほど相対的に広くなり、ブラウザの列幅とずれる）
+            maxWidths = MeasureRawColumnContentWidthsPx(a_table).Select(w => w + TABLE_CELL_BORDER_PX).ToArray();
+            // 最小の幅は1文字分（mdew・mdee の「編集ペインの幅に合わせる」の表は、セルの中の語・URL をどこでも折り返せる
+            // （overflow-wrap: anywhere）ため、ブラウザの計算でも列の最小の幅が1文字分になる。それと同じにする）
+            double minColumnWidth = TABLE_AUTO_COLUMN_MIN_WIDTH_PX;
+            var minWidths = maxWidths.Select(w => Math.Min(w, minColumnWidth)).ToArray();
+            double sumMin = minWidths.Sum();
+            double sumMax = maxWidths.Sum();
+            if (sumMin >= targetWidthPx || sumMax - sumMin <= 0.01)
+            {
+                return null;
+            }
+            double ratio = (targetWidthPx - sumMin) / (sumMax - sumMin);
+            var widths = new double[maxWidths.Length];
+            for (int c = 0; c < widths.Length; c++)
+            {
+                widths[c] = minWidths[c] + (maxWidths[c] - minWidths[c]) * ratio;
+            }
+            return widths;
+        }
+
+        /// <summary>
+        /// 表内の画像を、確定した列の実際の幅に収まるよう（画像の自然なピクセルサイズを上限に）
+        /// 縮小する。列幅の自動計算そのものからは画像を除外している（MeasureCellContentWidthPx
+        /// 参照）ため、これを行わないと、テキストの内容量だけで決まった狭い列から画像が
+        /// はみ出してしまう。Pixel列は列幅の値をそのまま使い、Star列は<paramref name="a_availableWidthPx"/>
+        /// とStar比率の合計から実際の表示幅を概算する（正確な値はレイアウト後でないと分からないが、
+        /// 画像がはみ出さない程度の概算で足りる）。Auto列（列幅補正オフ時）や、Star列でも比率の
+        /// 合計が0（列が無い等）の場合は、列単位の上限までは付けられないが、<paramref name="a_availableWidthPx"/>
+        /// が分かっていれば、少なくとも表がエディタの表示幅を超えて画像だけがはみ出すことがない
+        /// よう、エディタ全体の幅を上限として使う（ImageManager.ApplyImageSizingと同じ考え方）。
+        /// <paramref name="a_availableWidthPx"/>そのものが不明な場合（呼び出し側が把握していない、
+        /// 保存専用の使い捨て文書やPDF書き出し用の一時文書など）に限り、対象外とする。
+        /// ImageManager.ApplyImageSizingConsideringTableから、画像1枚ごとのソース解決タイミング
+        /// （ズーム・リサイズ時を含む）でも呼ばれるため、public化している。
+        /// </summary>
+        /// <param name="a_table">対象の表。</param>
+        /// <param name="a_availableWidthPx">表を表示できる実際の幅（px）。Star列の概算や、列単位の
+        /// 上限を付けられない列のフォールバックに使う。呼び出し側が把握していない場合はnull。</param>
+        public static void ConstrainCellImagesToColumnWidths(Table a_table, double? a_availableWidthPx)
+        {
+            int colCount = a_table.Columns.Count;
+            double starSum = 0;
+            for (int c = 0; c < colCount; c++)
+            {
+                if (GridUnitType.Star == a_table.Columns[c].Width.GridUnitType)
+                {
+                    starSum += a_table.Columns[c].Width.Value;
+                }
+            }
+
+            var columnBudgets = new double?[colCount];
+            for (int c = 0; c < colCount; c++)
+            {
+                GridLength w = a_table.Columns[c].Width;
+                if (GridUnitType.Pixel == w.GridUnitType)
+                {
+                    columnBudgets[c] = Math.Max(1, w.Value - TABLE_CELL_HORIZONTAL_PADDING);
+                }
+                else if (GridUnitType.Star == w.GridUnitType && a_availableWidthPx.HasValue && starSum > 0)
+                {
+                    double share = a_availableWidthPx.Value * (w.Value / starSum);
+                    columnBudgets[c] = Math.Max(1, share - TABLE_CELL_HORIZONTAL_PADDING);
+                }
+                else if (a_availableWidthPx.HasValue)
+                {
+                    // Auto列（列幅補正オフ）や、Star列でも比率の合計が0の場合は、列単位の
+                    // 上限は付けられないが、a_availableWidthPxが分かっているのであれば、
+                    // 表がエディタの表示幅を超えて画像だけがはみ出すことは避けたいため、
+                    // エディタ全体の幅をフォールバックの上限として使う。
+                    columnBudgets[c] = Math.Max(1, a_availableWidthPx.Value - TABLE_CELL_HORIZONTAL_PADDING);
+                }
+                // a_availableWidthPxそのものが不明な場合のみ対象外（nullのまま）。
+            }
+
+            foreach (TableRowGroup rg in a_table.RowGroups)
+            {
+                foreach (TableRow row in rg.Rows)
+                {
+                    for (int c = 0; c < row.Cells.Count && c < colCount; c++)
+                    {
+                        if (columnBudgets[c].HasValue)
+                        {
+                            ConstrainImagesInCellToWidth(row.Cells[c], columnBudgets[c].Value);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>1つのセル内の画像（複数あれば全て）を、指定した幅（px）に収まるよう
+        /// （画像の自然なピクセルサイズを上限に）縮小する。縦横比は維持する。</summary>
+        /// <param name="a_cell">対象のセル。</param>
+        /// <param name="a_maxWidthPx">収めたい幅（px）。</param>
+        private static void ConstrainImagesInCellToWidth(TableCell a_cell, double a_maxWidthPx)
+        {
+            foreach (Block block in a_cell.Blocks)
+            {
+                if (!(block is Paragraph p))
+                {
+                    continue;
+                }
+                foreach (Inline inline in p.Inlines)
+                {
+                    if (!(inline is InlineUIContainer iuc) || !(iuc.Child is Image img) ||
+                        !(img.Source is BitmapSource bmp))
+                    {
+                        continue;
+                    }
+                    double naturalWidth = bmp.PixelWidth;
+                    double naturalHeight = bmp.PixelHeight;
+                    if (naturalWidth <= 0 || naturalHeight <= 0)
+                    {
+                        continue;
+                    }
+                    double targetWidth = Math.Min(naturalWidth, a_maxWidthPx);
+                    double scale = targetWidth / naturalWidth;
+                    img.Width = targetWidth;
+                    img.Height = naturalHeight * scale;
+                }
+            }
+        }
+
+        /// <summary>
+        /// ウインドウ（エディタ）のリサイズ時に、表の列幅を現在の表示幅に合わせて再計算する。
+        /// 未調整（自動計算）の表はApplyAutoCalculatedColumnWidths、調整済み（列ごとに
+        /// 区切り行のダッシュ数が異なる）の表はApplyExplicitColumnWidthsで、それぞれ
+        /// 再計算する。ApplyExplicitColumnWidthsもコンパクトな固定幅（Pixel）とStar比率を
+        /// 表示幅に応じて切り替えるようになったため（詳細は同メソッドのコメント参照）、
+        /// 調整済みの表も、リサイズ後に幅が狭くなってPixel幅の合計が収まらなくなった場合は
+        /// Star比率へ、逆に広がってStar比率のままでは間延びして見える場合はPixelへ、切り替える
+        /// 必要がある。呼び出し元はどちらの場合もこのメソッドを呼べばよく、区別する必要はない。
+        /// MainWindow.EditorSizeChanged（TableEditor.RefreshAutoCalculatedColumnWidthsForResize
+        /// 経由）から、表ごとに呼ばれる。
+        /// </summary>
+        /// <param name="a_table">対象の表。</param>
+        /// <param name="a_availableWidthPx">現在、表を表示できる幅（px）。</param>
+        public static void RefreshAutoCalculatedColumnWidths(Table a_table, double a_availableWidthPx)
+        {
+            var sourceDashCounts = GetSourceDashCounts(a_table);
+            if (IsAutoCalculatedDashCounts(sourceDashCounts))
+            {
+                ApplyAutoCalculatedColumnWidths(a_table, a_availableWidthPx);
+            }
+            else
+            {
+                var explicitDashCounts = sourceDashCounts
+                    .Select(d => TABLE_COLUMN_DEFAULT_DASH_COUNT == d ? (int?)null : d)
+                    .ToList();
+                ApplyExplicitColumnWidths(a_table, explicitDashCounts, a_availableWidthPx);
+            }
+        }
+
+        /// <summary>表の全列の幅を、既定のAuto幅（列幅調整の効果を一切適用しない、これまでの
+        /// 既定の見た目）へ戻す。メニュー「列幅を補正する」がオフの場合に使う。区切り行の
+        /// ダッシュ数（GetSourceDashCounts／SetSourceDashCounts）には一切触れない。あくまで
+        /// 表示だけを既定に戻すものであり、すでに調整済みの表の情報を消してしまわないように
+        /// するため（オンに戻せば元の比率がそのまま復元される）。</summary>
+        /// <param name="a_table">対象の表。</param>
+        private static void ResetColumnWidthsToAuto(Table a_table)
+        {
+            foreach (TableColumn col in a_table.Columns)
+            {
+                col.Width = new GridLength(0, GridUnitType.Auto);
+            }
+        }
+
+        /// <summary>
+        /// メニュー「列幅を補正する」の状態と、区切り行のダッシュ数（Markdownソースの値）から、
+        /// 表の実際の列幅（表示のみ。TableColumn.Width）を決定して適用する。
+        /// MarkdownConverter.MarkdownToDocumentでの新規解析時と、列幅調整ダイアログでOKが
+        /// 押された時（TableEditor.ApplyColumnWidths）の両方から呼ばれる、共通の適用ロジック。
+        /// いずれの呼び出し側も、このメソッドとは別に、区切り行のダッシュ数そのもの
+        /// （保存されるべき「本当の値」）をSetSourceDashCountsで記録しておくこと（このメソッド
+        /// 自身は表示だけを担当し、記録には関与しない）。
+        /// 【挙動】
+        /// ・「列幅を補正する」がオフ：ダッシュ数の内容に関わらず、常に既定のAuto幅（均等）に
+        /// 　戻す（列幅機能全体のマスタースイッチ。すでにダイアログで明示的に調整済みの表も
+        /// 　含めて、オフの間はすべて均等幅で表示される。ダッシュ数はSetSourceDashCountsの
+        /// 　記録・Markdownソース側にそのまま残るため、オンに戻せば元の比率が復元される）。
+        /// ・オン＋全列のダッシュ数が互いに同じ（未調整）：内容量から自動計算した比率を、
+        /// 　表示上だけ適用する（ApplyAutoCalculatedColumnWidths）。既定値（|---|、3個）
+        /// 　ちょうどである必要はなく、全列そろっていれば既定値以外でも未調整として扱う
+        /// 　（詳細はIsAutoCalculatedDashCountsのコメント参照。手書きのMarkdownで見た目を
+        /// 　整えるために全列そろえて3個より多くのダッシュを書いているだけの表まで、
+        /// 　毎回全幅表示になってしまう不具合への対策）。
+        /// ・オン＋列によってダッシュ数が異なる（調整済み）：ダッシュ数を比率として使い、
+        /// 　その比率での幅が編集領域に収まるならコンパクトな固定幅（Pixel）、収まらなければ
+        /// 　編集領域いっぱいまでのStar比率にする（ApplyExplicitColumnWidths参照。指定した
+        /// 　比率を保ったまま、表全体を無条件に全幅表示してしまわないようにするための方針）。
+        /// </summary>
+        /// <param name="a_table">対象の表。</param>
+        /// <param name="a_dashCounts">列ごとの区切り行のダッシュ数（Markdownソースの値そのもの）。
+        /// 表の列数と件数が一致していること。</param>
+        /// <param name="a_correctColumnWidthsFlg">メニュー「列幅を補正する」の現在の状態。</param>
+        /// <param name="a_availableWidthPx">表を表示できる実際の幅（px）。未調整の表への
+        /// 自動計算比率（ApplyAutoCalculatedColumnWidths）で、コンパクトな固定幅（Pixel）に
+        /// できるかどうかの判断に使う。呼び出し側が把握していない場合はnull（その場合は
+        /// 常にStar比率にする。詳細はApplyAutoCalculatedColumnWidthsのコメント参照）。</param>
+        public static void ApplyEffectiveColumnWidths(
+            Table a_table, IReadOnlyList<int> a_dashCounts, bool a_correctColumnWidthsFlg, double? a_availableWidthPx)
+        {
+            if (!a_correctColumnWidthsFlg)
+            {
+                ResetColumnWidthsToAuto(a_table);
+                return;
+            }
+            if (IsAutoCalculatedDashCounts(a_dashCounts))
+            {
+                ApplyAutoCalculatedColumnWidths(a_table, a_availableWidthPx);
+            }
+            else
+            {
+                var explicitDashCounts = a_dashCounts
+                    .Select(d => TABLE_COLUMN_DEFAULT_DASH_COUNT == d ? (int?)null : d)
+                    .ToList();
+                ApplyExplicitColumnWidths(a_table, explicitDashCounts, a_availableWidthPx);
+            }
+        }
+    }
+}

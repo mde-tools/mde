@@ -1,0 +1,487 @@
+﻿<Window x:Class="mde.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:sys="clr-namespace:System;assembly=mscorlib"
+        xmlns:common="clr-namespace:mde.common"
+        Title="mde"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
+        Height="860" Width="1240"
+        FontFamily="Segoe UI, Yu Gothic UI"
+        Background="{StaticResource CardBrush}"
+        PreviewKeyDown="MainWindowPreviewKeyDown"
+        Closing="WindowClosing">
+
+    <Window.Resources>
+        <!-- 行の間隔・段落や箇条書きの間隔（mdew の GitHubスタイルの調整結果に合わせた固定値。文字の大きさ 16px の時）。
+             以前の「表示」→「行間を設定…」は廃止した。
+               EditorLineHeight：本文の段落の行の間隔（25px。mdew の 1.5625 倍）。FlowDocument の LineHeight に指定し、
+                 中の段落へ引き継がせる（見出し・表のセル・画像の段落は、それぞれ自分の値を持つ）
+               EditorListLineHeight：箇条書きの項目の中の行の間隔（25.6px。mdew の 1.6 倍）。List の LineHeight に指定し、
+                 項目の段落へ引き継がせる
+               EditorListItemSpacing：箇条書きの項目と項目の間（7.36px。mdew の 0.46em）。ListItem の上の余白にする。
+                 入れ子の箇条書きの最初の項目にも付くので、親の項目の文字と入れ子の項目の間も同じだけ空く
+                 （mdew と同じ）。上下に並んだブロックの余白は重ねて数えられるので、箇条書きの最初の項目の上の余白は、
+                 前の段落の下の余白に吸収される
+               EditorBlockSpacing：段落の下の余白（12.2px。mdew の 0.7625em）
+               EditorListSpacing：箇条書き・表の下の余白（12.8px。mdew の 0.8em）
+             ゼロにはしない：見出し・コードブロック・水平線はそれぞれ固有のMarginを明示的に持っているのに対し、
+             通常の段落・リスト・表はこの共有の値だけを頼りにしているため、ここが0だと、空行区切りのMarkdown段落
+             どうしが単純な行の折り返しと見分けが付かなくなってしまう。 -->
+        <sys:Double x:Key="EditorLineHeight">25</sys:Double>
+        <sys:Double x:Key="EditorListLineHeight">25.6</sys:Double>
+        <Thickness x:Key="EditorListItemSpacing">0,7.36,0,0</Thickness>
+        <Thickness x:Key="EditorBlockSpacing">0,0,0,12.2</Thickness>
+        <Thickness x:Key="EditorListSpacing">0,0,0,12.8</Thickness>
+        <!-- 箇条書きの左の字下げ（記号の分）。番号付きは少し広い。
+             ここまでの値は GitHubスタイルのもの。VSCodeスタイルの時は MainWindow.ApplyDocStyle が
+             BlockStyles の値で上書きする（メニュー「表示」→「表示スタイル」）。 -->
+        <Thickness x:Key="EditorListPadding">32,0,0,0</Thickness>
+        <Thickness x:Key="EditorDecimalListPadding">34,0,0,0</Thickness>
+        <!-- エディタの表示フォント（mdew・mdee と同じ Meiryo。VSCodeスタイルの時は MainWindow.ApplyEditorFontFamily が
+             VSCodeスタイルのフォントに上書きする。EditorLineHeightと同じパターン）。 -->
+        <FontFamily x:Key="EditorFontFamily">Meiryo, Segoe UI</FontFamily>
+        <!-- 右クリックのメニューの項目。見た目はすべてのメニューと同じ（MenuStyles.xaml の MenuItem のスタイル）。
+             メニューの見出し（MenuHeading）も MenuStyles.xaml にある。 -->
+        <Style TargetType="MenuItem" x:Key="CtxMenuItem" BasedOn="{StaticResource {x:Type MenuItem}}"/>
+        <Style TargetType="Button" x:Key="ZoomButton" BasedOn="{StaticResource ToolbarButton}">
+            <Setter Property="Width" Value="28"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+        </Style>
+        <Style TargetType="TreeViewItem">
+            <Setter Property="Padding" Value="2,3"/>
+        </Style>
+    </Window.Resources>
+
+    <!-- 表示倍率の表示（m_zoomToast）を、ウィンドウ全体の中央に重ねるための Grid -->
+    <Grid>
+    <DockPanel>
+
+        <!-- ===================== Menu bar ===================== -->
+        <!-- メニューバー（mdew と同じ見た目：背景は白・枠線なし・文字は Yu Gothic UI の 12px。項目・メニューの見た目は
+             MenuStyles.xaml） -->
+        <Menu DockPanel.Dock="Top" Background="White" BorderThickness="0" Padding="2,0"
+              FontFamily="{StaticResource MenuFont}" FontSize="12" TextOptions.TextFormattingMode="Display">
+            <MenuItem Header="ファイル(_F)">
+                <MenuItem Header="新規作成(_N)" Click="NewBtnClick" InputGestureText="Ctrl+N"/>
+                <MenuItem Header="開く…(_O)" Click="OpenBtnClick" InputGestureText="Ctrl+O"/>
+                <MenuItem Header="フォルダを開く…(_D)" Click="OpenFolderMenuClick"/>
+                <Separator/>
+                <!-- 最近使ったファイル・フォルダのサブメニューは、クリックした時か、マウスを乗せて少し待った時に開く
+                     （WPF の通常のメニューの動き。待つ時間は Windows の設定に従う。mdew と同じ）。下の項目へマウスを
+                     動かす途中で通り過ぎるだけなら開かないので、長いサブメニューがほかの項目を隠すことはない。 -->
+                <MenuItem x:Name="m_recentFilesMenu" Header="最近使ったファイル(_R)"/>
+                <MenuItem x:Name="m_recentFoldersMenu" Header="最近使ったフォルダ(_F)"/>
+                <Separator/>
+                <MenuItem Header="保存(_S)" Click="SaveBtnClick" InputGestureText="Ctrl+S"/>
+                <MenuItem Header="名前を付けて保存…" Click="SaveAsBtnClick" InputGestureText="Shift+Ctrl+S"/>
+                <MenuItem Header="すべて保存(_A)" Click="SaveAllBtnClick"/>
+                <Separator/>
+                <MenuItem Header="PDFに書き出し…(_P)" Click="ExportPdfBtnClick" InputGestureText="Ctrl+P"/>
+                <MenuItem Header="PDFの余白を設定…(_M)" Click="PdfMarginBtnClick"/>
+                <Separator/>
+                <MenuItem Header="閉じる(_W)" Click="CloseBtnClick" InputGestureText="Ctrl+W"/>
+            </MenuItem>
+            <!-- 表示メニューは mdew と同じく、サブメニューを使わずに「見出し（選べない灰色の文字。MenuHeading）」と
+                 区切り線で項目をまとめる。並びも mdew と同じ（mde にしかない項目は「段落中の改行」の後に入れ、
+                 「表示スタイル」は最後、「デバッグログを有効にする」はさらにその後）。✓ と表示倍率は、メニューを
+                 開くたびに今の状態に合わせる（ViewMenuSubmenuOpened）。 -->
+            <MenuItem Header="表示(_V)" SubmenuOpened="ViewMenuSubmenuOpened">
+                <MenuItem x:Name="m_viewFolderPaneMenuItem" Header="フォルダを表示" Click="ToggleFolderPaneBtnClick"/>
+                <MenuItem x:Name="m_viewOutlinePaneMenuItem" Header="アウトラインを表示" Click="ToggleOutlinePaneBtnClick"/>
+                <MenuItem x:Name="m_viewStatusBarMenuItem" Header="ステータスバーを表示" Click="ToggleStatusBarClick"/>
+                <Separator/>
+                <MenuItem x:Name="m_viewSourceModeMenuItem" Header="ソースモード" Click="ToggleModeBtnClick"/>
+                <Separator/>
+                <MenuItem x:Name="m_viewZoomHeadingMenuItem" Header="表示倍率：100%" Style="{StaticResource MenuHeading}"/>
+                <MenuItem x:Name="m_viewZoomInMenuItem" Header="拡大" Click="ZoomInClick" InputGestureText="Ctrl++"/>
+                <MenuItem x:Name="m_viewZoomOutMenuItem" Header="縮小" Click="ZoomOutClick" InputGestureText="Ctrl+-"/>
+                <MenuItem x:Name="m_viewZoomResetMenuItem" Header="100%に戻す" Click="ZoomResetClick" InputGestureText="Ctrl+0"/>
+                <Separator/>
+                <MenuItem Header="段落中の改行" Style="{StaticResource MenuHeading}"/>
+                <MenuItem x:Name="m_lineBreakModeSourceMenuItem" Header="ソースの通りに改行する(_S)"
+                          IsCheckable="True" Click="LineBreakModeSourceChecked"/>
+                <MenuItem x:Name="m_lineBreakModeBlankOnlyMenuItem" Header="空行が入るまで改行しない(_B)"
+                          IsCheckable="True" Click="LineBreakModeBlankOnlyChecked"/>
+                <Separator/>
+                <MenuItem Header="本文の幅" Style="{StaticResource MenuHeading}"/>
+                <MenuItem x:Name="m_docWidthLimitedMenuItem" Header="読みやすい幅にする（最大 884px）(_R)"
+                          IsCheckable="True" Click="DocWidthLimitedChecked"/>
+                <MenuItem x:Name="m_docWidthFullMenuItem" Header="編集ペインの幅に合わせる(_P)"
+                          IsCheckable="True" Click="DocWidthFullChecked"/>
+                <Separator/>
+                <MenuItem Header="リンクの開き方" Style="{StaticResource MenuHeading}"/>
+                <MenuItem x:Name="m_linkModeCtrlClickMenuItem" Header="Ctrl+クリックで開く(_C)"
+                          IsCheckable="True" Click="LinkModeCtrlClickChecked"/>
+                <MenuItem x:Name="m_linkModeClickOnlyMenuItem" Header="クリックのみで開く(_O)"
+                          IsCheckable="True" Click="LinkModeClickOnlyChecked"/>
+                <Separator/>
+                <MenuItem Header="箇条書きの記号" Style="{StaticResource MenuHeading}"/>
+                <MenuItem x:Name="m_markerStyleWpfStandardMenuItem" Header="WPF標準(_W)"
+                          IsCheckable="True" Click="MarkerStyleWpfStandardChecked"/>
+                <MenuItem x:Name="m_markerStyleUniformMenuItem" Header="すべての階層に同じ記号を使用する(_U)"
+                          IsCheckable="True" Click="MarkerStyleUniformChecked"/>
+                <Separator/>
+                <MenuItem Header="文字の色" Style="{StaticResource MenuHeading}"/>
+                <MenuItem x:Name="m_textColorSharpMenuItem" Header="くっきりした色(_K)"
+                          IsCheckable="True" Click="TextColorSharpChecked"/>
+                <MenuItem x:Name="m_textColorSoftMenuItem" Header="目にやさしい色(_E)"
+                          IsCheckable="True" Click="TextColorSoftChecked"/>
+                <Separator/>
+                <MenuItem Header="表示スタイル" Style="{StaticResource MenuHeading}"/>
+                <MenuItem x:Name="m_docStyleGithubMenuItem" Header="GitHubスタイル(_G)"
+                          IsCheckable="True" Click="DocStyleGithubChecked"/>
+                <MenuItem x:Name="m_docStyleVsCodeMenuItem" Header="VSCodeスタイル(_V)"
+                          IsCheckable="True" Click="DocStyleVsCodeChecked"/>
+                <Separator/>
+                <MenuItem x:Name="m_debugLogMenuItem" Header="デバッグログを有効にする(_D)"
+                          IsCheckable="True" Click="DebugLogMenuItemChecked"/>
+            </MenuItem>
+            <MenuItem Header="検索と置換" Click="FindReplaceBtnClick" InputGestureText="Ctrl+F"/>
+            <MenuItem Header="ヘルプ(_H)">
+                <MenuItem Header="Readmeを開く(_R)" Click="OpenReadmeBtnClick"/>
+                <Separator/>
+                <MenuItem Header="バージョン情報(_A)" Click="VersionInfoBtnClick"/>
+            </MenuItem>
+        </Menu>
+
+        <!-- ===================== Status bar (panes / zoom / mode) ===================== -->
+        <!-- メニュー「表示」→「ステータスバーを表示」で表示・非表示を切り替える（ToggleStatusBarClick） -->
+        <Border x:Name="m_statusBar" DockPanel.Dock="Bottom" BorderBrush="{StaticResource ThinBorderBrush}" BorderThickness="0,1,0,0"
+                Padding="4,1,2,1">
+            <Grid>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
+                    <Button x:Name="m_toggleFolderPaneBtn" Content="フォルダを隠す" Style="{StaticResource ToolbarButton}" Click="ToggleFolderPaneBtnClick"/>
+                    <Button x:Name="m_toggleOutlinePaneBtn" Content="アウトラインを隠す" Style="{StaticResource ToolbarButton}" Click="ToggleOutlinePaneBtnClick"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button x:Name="m_toggleModeBtn" Content="ソースモードに切替" Style="{StaticResource ToolbarButton}" Click="ToggleModeBtnClick"/>
+
+                    <Grid Width="30" />
+
+                    <Button Content="－" Style="{StaticResource ZoomButton}" Click="ZoomOutClick"/>
+                    <Button x:Name="m_zoomLabelBtn" Content="100%" Width="Auto" Style="{StaticResource ToolbarButton}"
+                            Click="ZoomResetClick"/>
+                    <Button Content="＋" Style="{StaticResource ZoomButton}" Click="ZoomInClick"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- ===================== Body: folder | outline | editor ===================== -->
+        <Grid Margin="0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition x:Name="m_folderColumnDef" Width="190"/>
+                <ColumnDefinition x:Name="m_folderSplitterColumnDef" Width="2"/>
+                <ColumnDefinition x:Name="m_outlineColumnDef" Width="210"/>
+                <ColumnDefinition x:Name="m_outlineSplitterColumnDef" Width="2"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- ==== Folder pane ==== -->
+            <Border x:Name="m_folderPaneBorder" Grid.Column="0" Background="{StaticResource ListPaneBrush}"
+                    BorderBrush="{StaticResource LineBrush}" BorderThickness="0,0,0,0" CornerRadius="0">
+                <DockPanel Margin="0,0,0,0">
+                    <Grid DockPanel.Dock="Top" Margin="8,8,4,6">
+                        <TextBlock Text="フォルダ" FontWeight="Bold" FontSize="12" VerticalAlignment="Center"
+                                   Foreground="{StaticResource InkBrush}"/>
+                        <Button Content="…" Width="24" Height="22" HorizontalAlignment="Right"
+                                Style="{StaticResource ToolbarButton}" Margin="0" Padding="0"
+                                Click="OpenFolderTreeBtnClick"/>
+                    </Grid>
+                    <TreeView x:Name="m_folderTree" BorderThickness="0" Background="Transparent"
+                              Loaded="FolderTreeLoaded"
+                              SelectedItemChanged="FolderTreeSelectedItemChanged">
+                        <TreeView.Resources>
+                            <Style TargetType="TreeViewItem">
+                                <EventSetter Event="Expanded" Handler="TreeViewItemExpanded"/>
+                                <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}"/>
+                                <Setter Property="IsSelected" Value="{Binding IsSelected, Mode=TwoWay}"/>
+                                <!-- アウトラインペイン（下のm_outlineTree）と同じ理由・同じ対策。
+                                     ファイル名が短い場合はずれ幅が目立たないだけで、選択・フォーカスの
+                                     たびに既定の横スクロールが発生する仕組み自体は同じであることが、
+                                     実機での確認で分かったため、こちらにも対策を入れている（詳しい
+                                     理由はFolderTreeItemRequestBringIntoViewのコメント参照）。 -->
+                                <EventSetter Event="RequestBringIntoView" Handler="FolderTreeItemRequestBringIntoView"/>
+                            </Style>
+                        </TreeView.Resources>
+                        <TreeView.ItemTemplate>
+                            <HierarchicalDataTemplate ItemsSource="{Binding Children}">
+                                <Border x:Name="m_matchHighlightBorder" CornerRadius="3" Padding="3,1"
+                                        BorderThickness="1,1,1,1" BorderBrush="Transparent" Margin="-1,0,0,0">
+                                    <TextBlock Text="{Binding DisplayName}" FontSize="12" Foreground="{StaticResource InkBrush}"/>
+                                </Border>
+                                <HierarchicalDataTemplate.Triggers>
+                                    <!-- 選択中(IsSelected)・検索一致(IsSearchMatch)は同時に成立しうる
+                                         組み合わせで、どちらもBackgroundを取り合うと片方の情報が
+                                         見えなくなる（DEVELOPMENT_LOG.md 14.7参照）。選択は枠線
+                                         （BorderBrush）、検索一致は背景色（Background）と、別々の
+                                         プロパティで表現することで両立させる。「選択中だが検索一致
+                                         ではない」場合だけ、従来どおりの塗りつぶし背景も付ける
+                                         （単なる選択だけでも見やすいように）。 -->
+                                    <DataTrigger Binding="{Binding IsSearchMatch}" Value="True">
+                                        <Setter TargetName="m_matchHighlightBorder" Property="Background" Value="#FFE166"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding RelativeSource={RelativeSource AncestorType=TreeViewItem}, Path=IsSelected}" Value="True">
+                                        <Setter TargetName="m_matchHighlightBorder" Property="BorderBrush" Value="#26A0DA"/>
+                                        <Setter TargetName="m_matchHighlightBorder" Property="CornerRadius" Value="0"/>
+                                    </DataTrigger>
+                                    <MultiDataTrigger>
+                                        <MultiDataTrigger.Conditions>
+                                            <Condition Binding="{Binding RelativeSource={RelativeSource AncestorType=TreeViewItem}, Path=IsSelected}" Value="True"/>
+                                            <Condition Binding="{Binding IsSearchMatch}" Value="False"/>
+                                        </MultiDataTrigger.Conditions>
+                                        <Setter TargetName="m_matchHighlightBorder" Property="Background" Value="#CBE8F6"/>
+                                    </MultiDataTrigger>
+                                </HierarchicalDataTemplate.Triggers>
+                            </HierarchicalDataTemplate>
+                        </TreeView.ItemTemplate>
+                    </TreeView>
+                </DockPanel>
+            </Border>
+
+            <GridSplitter x:Name="m_folderSplitter" Grid.Column="1" HorizontalAlignment="Stretch" Width="1" Background="{StaticResource ThinBorderBrush}"/>
+
+            <!-- ==== Outline pane ==== -->
+            <Border x:Name="m_outlinePaneBorder" Grid.Column="2" Background="{StaticResource ListPaneBrush}"
+                    BorderBrush="{StaticResource LineBrush}" BorderThickness="0,0,0,0" CornerRadius="0">
+                <DockPanel Margin="0,0,0,0">
+                    <TextBlock DockPanel.Dock="Top" Text="アウトライン" FontWeight="Bold" FontSize="12"
+                               Margin="8,8,8,6" Foreground="{StaticResource InkBrush}"/>
+                    <!-- フォルダペイン（上のm_folderTree）と同じ構成のTreeView。横スクロールバーの
+                         見た目・挙動（TextTrimmingを付けない、BringIntoView後に横スクロールだけ
+                         0へ戻す等）もフォルダペインに合わせている。以前、アウトラインだけ
+                         TextTrimming="CharacterEllipsis"を付けていた際に、長い見出しを選択した
+                         瞬間だけ表示が一瞬崩れる不具合があったため（DEVELOPMENT_LOG.md参照）。 -->
+                    <TreeView x:Name="m_outlineTree" BorderThickness="0" Background="Transparent"
+                              Loaded="OutlineTreeLoaded"
+                              SelectedItemChanged="OutlineTreeSelectedItemChanged">
+                        <TreeView.Resources>
+                            <Style TargetType="TreeViewItem">
+                                <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}"/>
+                                <Setter Property="IsSelected" Value="{Binding IsSelected, Mode=TwoWay}"/>
+                                <!-- 選択・フォーカスが変わるたびにWPF標準の動作で項目を横方向にも
+                                     完全に見せようとスクロールしてしまう（見出しが長い場合、選択の
+                                     たびに横スクロールバーが一瞬右へずれて戻る「ちらつき」の原因）。
+                                     RequestBringIntoViewを横方向だけ無効化することで、そもそも
+                                     この自動スクロールを起こさせないようにする（詳しい理由は
+                                     OutlineTreeItemRequestBringIntoViewのコメント参照）。 -->
+                                <EventSetter Event="RequestBringIntoView" Handler="OutlineTreeItemRequestBringIntoView"/>
+                            </Style>
+                        </TreeView.Resources>
+                        <TreeView.ItemTemplate>
+                            <HierarchicalDataTemplate ItemsSource="{Binding Children}">
+                                <Border x:Name="m_matchHighlightBorder" CornerRadius="3" Padding="3,1"
+                                        BorderThickness="1,1,1,1" BorderBrush="Transparent" Margin="-1,0,0,0">
+                                    <TextBlock Text="{Binding Text}" FontSize="{Binding FontSizeValue}" Foreground="{StaticResource InkBrush}"/>
+                                </Border>
+                                <HierarchicalDataTemplate.Triggers>
+                                    <!-- フォルダペインと同じ理由・同じ対策（DEVELOPMENT_LOG.md 14.7、
+                                         MainWindow.xamlのm_folderTree側のコメント参照）。選択は
+                                         枠線、検索一致は背景色と別プロパティにして両立させる。 -->
+                                    <DataTrigger Binding="{Binding IsSearchMatch}" Value="True">
+                                        <Setter TargetName="m_matchHighlightBorder" Property="Background" Value="#FFE166"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding RelativeSource={RelativeSource AncestorType=TreeViewItem}, Path=IsSelected}" Value="True">
+                                        <Setter TargetName="m_matchHighlightBorder" Property="BorderBrush" Value="#26A0DA"/>
+                                        <Setter TargetName="m_matchHighlightBorder" Property="CornerRadius" Value="0"/>
+                                    </DataTrigger>
+                                    <MultiDataTrigger>
+                                        <MultiDataTrigger.Conditions>
+                                            <Condition Binding="{Binding RelativeSource={RelativeSource AncestorType=TreeViewItem}, Path=IsSelected}" Value="True"/>
+                                            <Condition Binding="{Binding IsSearchMatch}" Value="False"/>
+                                        </MultiDataTrigger.Conditions>
+                                        <Setter TargetName="m_matchHighlightBorder" Property="Background" Value="#CBE8F6"/>
+                                    </MultiDataTrigger>
+                                </HierarchicalDataTemplate.Triggers>
+                            </HierarchicalDataTemplate>
+                        </TreeView.ItemTemplate>
+                    </TreeView>
+                </DockPanel>
+            </Border>
+
+            <GridSplitter x:Name="m_outlineSplitter" Grid.Column="3" HorizontalAlignment="Stretch" Width="1" Background="{StaticResource ThinBorderBrush}"/>
+
+            <!-- ==== Editor pane ==== -->
+            <Border Grid.Column="4" Background="{StaticResource CardBrush}" BorderBrush="{StaticResource LineBrush}"
+                    BorderThickness="0,0,0,0" CornerRadius="0">
+                <Grid>
+                    <RichTextBox x:Name="m_editor"
+                                 BorderThickness="0"
+                                 Background="Transparent"
+                                 Padding="25,0,25,0"
+                                 FontSize="16"
+                                 SelectionBrush="#3390FF"
+                                 SelectionOpacity="0.45"
+                                 VerticalScrollBarVisibility="Auto"
+                                 AcceptsTab="True"
+                                 SpellCheck.IsEnabled="False"
+                                 TextChanged="EditorTextChanged"
+                                 PreviewKeyDown="EditorPreviewKeyDown"
+                                 PreviewTextInput="EditorPreviewTextInput"
+                                 PreviewMouseWheel="EditorPreviewMouseWheel"
+                                 PreviewMouseLeftButtonDown="EditorPreviewMouseLeftButtonDown"
+                                 SizeChanged="EditorSizeChanged"
+                                 AllowDrop="True"
+                                 PreviewDragEnter="EditorDragEnter"
+                                 PreviewDragOver="EditorDragOver"
+                                 PreviewDrop="EditorDrop"
+                                 ContextMenuOpening="EditorContextMenuOpening">
+                        <RichTextBox.Resources>
+                            <Style TargetType="Paragraph">
+                                <Setter Property="Margin" Value="{DynamicResource EditorBlockSpacing}"/>
+                                <!-- 行の高さ（LineHeight）はここでは指定せず、FlowDocument（本文の段落）・List（箇条書きの
+                                     項目の段落）に指定した値を引き継がせる（段落の種類ごとに行の間隔を変えるため）。
+                                     LineStackingStrategyの既定値（MaxHeight）だと、LineHeightは
+                                     「最低でもこの高さ」という扱いになり、フォントが内部的に持つ
+                                     行送り（line gap）の方が大きければそちらが優先されてしまう。
+                                     Meiry0（表示フォント「新しいフォント」）はYu Gothic UIより
+                                     この内部の行送りがかなり大きいため、同じLineHeightを指定していても
+                                     Meiryoの方が行間・見出し下線までの余白が広く見えていた。
+                                     BlockLineHeightにすることでLineHeightを常にそのまま使うようになり、
+                                     フォントの違いによらず行間を統一できる（メニュー「表示」→
+                                     「表示フォント」参照）。 -->
+                                <Setter Property="LineStackingStrategy" Value="BlockLineHeight"/>
+                            </Style>
+                            <Style TargetType="List">
+                                <Setter Property="Margin" Value="{DynamicResource EditorListSpacing}"/>
+                                <Setter Property="LineHeight" Value="{DynamicResource EditorListLineHeight}"/>
+                                <Setter Property="Padding" Value="{DynamicResource EditorListPadding}"/>
+                                <!-- 以前はここでMarkerStyle=Circle/Squareの時だけList.FontSizeを
+                                     小さくして、2段目以降の記号（○）をTyporaのように小さく
+                                     見せていた。しかし、あるListItemが「自分の段落」と「さらに
+                                     ネストした子List」の両方をBlocksに持つ状態になると（＝箇条書き
+                                     の項目をTabでさらに字下げできる状態にすると）、その子Listに
+                                     このFontSize縮小が効いているかどうかによって、なぜか親である
+                                     自分自身の段落の文字まで異常に小さく表示されてしまうという、
+                                     ネストの深さを問わず追いかけてくる副作用が実機で確認された
+                                     （DESIGN.md 14.13参照）。安全のため、記号の縮小は一旦撤回し、
+                                     WPF既定の大きさに戻している。 -->
+                                <Style.Triggers>
+                                    <Trigger Property="MarkerStyle" Value="Decimal">
+                                        <Setter Property="Padding" Value="{DynamicResource EditorDecimalListPadding}"/>
+                                    </Trigger>
+                                </Style.Triggers>
+                            </Style>
+                            <Style TargetType="ListItem">
+                                <Setter Property="Margin" Value="{DynamicResource EditorListItemSpacing}"/>
+                            </Style>
+                            <Style TargetType="Table">
+                                <Setter Property="Margin" Value="{DynamicResource EditorListSpacing}"/>
+                                <Setter Property="CellSpacing" Value="0"/>
+                            </Style>
+                        </RichTextBox.Resources>
+                        <RichTextBox.ContextMenu>
+                            <ContextMenu x:Name="m_editorContextMenu">
+                                <MenuItem x:Name="m_textStyleMenuItem" Header="文字装飾" Style="{StaticResource CtxMenuItem}"
+                                          Visibility="Collapsed">
+                                    <MenuItem Header="通常表記に戻す" Tag="normal" Click="TextStyleItemClick"/>
+                                    <MenuItem Header="インラインコードにする" Tag="code" InputGestureText="Ctrl+Shift+@" Click="TextStyleItemClick"/>
+                                    <MenuItem Header="太字にする" Tag="bold" InputGestureText="Ctrl+B" Click="TextStyleItemClick"/>
+                                    <MenuItem Header="斜体にする" Tag="italic" InputGestureText="Ctrl+I" Click="TextStyleItemClick"/>
+                                    <MenuItem Header="取り消し線にする" Tag="strikethrough" InputGestureText="Alt+Shift+5" Click="TextStyleItemClick"/>
+                                    <MenuItem Header="下線を引く" Tag="underline" InputGestureText="Ctrl+U" Click="TextStyleItemClick"/>
+                                    <MenuItem Header="ハイライトにする" Tag="highlight" Click="TextStyleItemClick"/>
+                                    <MenuItem Header="リンクにする…" Tag="link" Click="TextStyleItemClick"/>
+                                </MenuItem>
+                                <MenuItem x:Name="m_linkMenuItem" Header="リンク" Style="{StaticResource CtxMenuItem}"
+                                          Visibility="Collapsed">
+                                    <MenuItem Header="リンクを開く" Click="LinkOpenClick"/>
+                                    <MenuItem Header="URLをコピー" Click="LinkCopyUrlClick"/>
+                                    <MenuItem Header="リンクを編集…" Click="LinkEditClick"/>
+                                    <MenuItem Header="リンクを解除" Click="LinkRemoveClick"/>
+                                </MenuItem>
+                                <MenuItem x:Name="m_headingMenuItem" Header="見出し" Style="{StaticResource CtxMenuItem}">
+                                    <MenuItem Header="本文（見出しなし）" Tag="0" IsCheckable="True" Click="HeadingItemClick"/>
+                                    <MenuItem Header="# 見出し1" Tag="1" IsCheckable="True" Click="HeadingItemClick"/>
+                                    <MenuItem Header="## 見出し2" Tag="2" IsCheckable="True" Click="HeadingItemClick"/>
+                                    <MenuItem Header="### 見出し3" Tag="3" IsCheckable="True" Click="HeadingItemClick"/>
+                                    <MenuItem Header="#### 見出し4" Tag="4" IsCheckable="True" Click="HeadingItemClick"/>
+                                    <MenuItem Header="##### 見出し5" Tag="5" IsCheckable="True" Click="HeadingItemClick"/>
+                                    <MenuItem Header="###### 見出し6" Tag="6" IsCheckable="True" Click="HeadingItemClick"/>
+                                </MenuItem>
+                                <MenuItem x:Name="m_insertTableMenuItem" Header="表を挿入" Style="{StaticResource CtxMenuItem}"
+                                          Click="InsertTableItemClick"/>
+                                <MenuItem x:Name="m_insertRowAboveMenuItem" Header="上に行を挿入" Style="{StaticResource CtxMenuItem}"
+                                          Click="InsertRowAboveItemClick" Visibility="Collapsed"/>
+                                <MenuItem x:Name="m_insertRowBelowMenuItem" Header="下に行を挿入" Style="{StaticResource CtxMenuItem}"
+                                          Click="InsertRowBelowItemClick" Visibility="Collapsed"/>
+                                <MenuItem x:Name="m_insertColumnLeftMenuItem" Header="左に列を挿入" Style="{StaticResource CtxMenuItem}"
+                                          Click="InsertColumnLeftItemClick" Visibility="Collapsed"/>
+                                <MenuItem x:Name="m_insertColumnRightMenuItem" Header="右に列を挿入" Style="{StaticResource CtxMenuItem}"
+                                          Click="InsertColumnRightItemClick" Visibility="Collapsed"/>
+                                <MenuItem x:Name="m_adjustColumnWidthsMenuItem" Header="列幅を調整…" Style="{StaticResource CtxMenuItem}"
+                                          Click="AdjustColumnWidthsItemClick" Visibility="Collapsed"/>
+                                <MenuItem x:Name="m_deleteRowMenuItem" Header="この行を削除" Style="{StaticResource CtxMenuItem}"
+                                          Click="DeleteRowItemClick" Visibility="Collapsed"/>
+                                <MenuItem x:Name="m_deleteColumnMenuItem" Header="この列を削除" Style="{StaticResource CtxMenuItem}"
+                                          Click="DeleteColumnItemClick" Visibility="Collapsed"/>
+                                <MenuItem x:Name="m_deleteTableMenuItem" Header="表を削除" Style="{StaticResource CtxMenuItem}"
+                                          Click="DeleteTableItemClick" Visibility="Collapsed"/>
+                                <MenuItem x:Name="m_copyTableMenuItem" Header="表をコピー" Style="{StaticResource CtxMenuItem}"
+                                          Click="CopyTableItemClick" Visibility="Collapsed"/>
+                                <MenuItem x:Name="m_copyCodeBlockMenuItem" Header="コードブロック全体をコピー（```込み）" Style="{StaticResource CtxMenuItem}"
+                                          Click="CopyCodeBlockItemClick" Visibility="Collapsed"/>
+                                <MenuItem x:Name="m_copyForExcelMenuItem" Header="Excel用にコピー" Style="{StaticResource CtxMenuItem}"
+                                          Click="CopyForExcelItemClick" Visibility="Collapsed"/>
+                                <MenuItem x:Name="m_openImageMenuItem" Header="画像を開く" Style="{StaticResource CtxMenuItem}"
+                                          Click="OpenImageItemClick" Visibility="Collapsed"/>
+                                <MenuItem x:Name="m_saveImageMenuItem" Header="画像を保存…" Style="{StaticResource CtxMenuItem}"
+                                          Click="SaveImageItemClick" Visibility="Collapsed"/>
+                                <MenuItem x:Name="m_deleteImageMenuItem" Header="画像を削除" Style="{StaticResource CtxMenuItem}"
+                                          Click="DeleteImageItemClick" Visibility="Collapsed"/>
+                                <Separator/>
+                                <MenuItem Header="ページトップに戻る" Style="{StaticResource CtxMenuItem}" Click="ScrollToPageTopClick"/>
+                                <MenuItem x:Name="m_toggleModeMenuItem" Header="ソースモードに切り替え"
+                                          Style="{StaticResource CtxMenuItem}" Click="ToggleModeBtnClick"/>
+                                <!-- フォルダビュー・アウトラインビューの表示・非表示（メニュー「表示」と同じ。✓ は開く時に
+                                     EditorContextMenuOpening で今の状態に合わせる） -->
+                                <Separator/>
+                                <MenuItem x:Name="m_ctxFolderPaneMenuItem" Header="フォルダを表示"
+                                          Style="{StaticResource CtxMenuItem}" Click="ToggleFolderPaneBtnClick"/>
+                                <MenuItem x:Name="m_ctxOutlinePaneMenuItem" Header="アウトラインを表示"
+                                          Style="{StaticResource CtxMenuItem}" Click="ToggleOutlinePaneBtnClick"/>
+                            </ContextMenu>
+                        </RichTextBox.ContextMenu>
+                        <FlowDocument x:Name="m_editorDocument" FontFamily="{DynamicResource EditorFontFamily}"
+                                      LineHeight="{DynamicResource EditorLineHeight}"/>
+                    </RichTextBox>
+
+                    <TextBox x:Name="m_sourceEditor"
+                             Visibility="Collapsed"
+                             BorderThickness="0"
+                             Background="#F0F0F0"
+                             Foreground="#000000"
+                             Padding="30,32"
+                             FontFamily="{DynamicResource EditorFontFamily}"
+                             FontSize="16"
+                             AcceptsReturn="True"
+                             AcceptsTab="True"
+                             TextWrapping="Wrap"
+                             VerticalScrollBarVisibility="Auto"
+                             TextChanged="SourceEditorTextChanged"
+                             ContextMenuOpening="SourceEditorContextMenuOpening"
+                             PreviewMouseWheel="SourceEditorPreviewMouseWheel">
+                        <TextBox.ContextMenu>
+                            <ContextMenu x:Name="m_sourceEditorContextMenu">
+                                <MenuItem Header="ページトップに戻る" Click="ScrollToPageTopClick"/>
+                                <MenuItem Header="Markdownモードに切り替え" Click="ToggleModeBtnClick"/>
+                                <Separator/>
+                                <MenuItem x:Name="m_sourceCtxFolderPaneMenuItem" Header="フォルダを表示" Click="ToggleFolderPaneBtnClick"/>
+                                <MenuItem x:Name="m_sourceCtxOutlinePaneMenuItem" Header="アウトラインを表示" Click="ToggleOutlinePaneBtnClick"/>
+                            </ContextMenu>
+                        </TextBox.ContextMenu>
+                    </TextBox>
+                </Grid>
+            </Border>
+        </Grid>
+    </DockPanel>
+
+    <!-- 拡大・縮小した時に、今の表示倍率をウィンドウの中央に1秒ほど表示する（MainWindow.ShowZoomToast。mdew と同じ見た目）。
+         普段は透明。マウスの操作は受け取らない -->
+    <Border x:Name="m_zoomToast" HorizontalAlignment="Center" VerticalAlignment="Center" Opacity="0" IsHitTestVisible="False"
+            Background="#99000000" CornerRadius="8" Padding="28,10">
+        <TextBlock x:Name="m_zoomToastText" Foreground="White" FontSize="36" FontFamily="Yu Gothic UI, Segoe UI"/>
+    </Border>
+    </Grid>
+</Window>

@@ -1,0 +1,127 @@
+﻿// AppSettings.cs
+//
+// mde (Markdown インラインエディタ) の一部。
+// アプリ終了時のウィンドウ状態（サイズ・位置・最大化有無・フォルダ/アウトラインペインの
+// 表示有無・表示倍率）を記憶し、次回起動時に復元するための設定クラス。
+// %AppData%\mde\settings.json にJSON形式で保存する。
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text.Json;
+
+namespace mde
+{
+    /// <summary>次回起動時に復元する、ウィンドウ・ペインの状態一式。</summary>
+    public class AppSettings
+    {
+        public double WindowWidth { get; set; } = 810;
+        public double WindowHeight { get; set; } = 670;
+        public double WindowLeft { get; set; } = double.NaN;
+        public double WindowTop { get; set; } = double.NaN;
+        public bool IsMaximized { get; set; } = false;
+        public bool FolderPaneVisible { get; set; } = false;
+        public double FolderPaneWidth { get; set; } = 200;
+        public bool OutlinePaneVisible { get; set; } = false;
+
+        /// <summary>メニュー「表示」→「ステータスバーを表示」の状態。既定は true（表示する）。</summary>
+        public bool StatusBarVisible { get; set; } = true;
+        public double OutlinePaneWidth { get; set; } = 200;
+        public double ZoomLevel { get; set; } = 1.0;
+        public bool RequireCtrlForLinkClickFlg { get; set; } = true;
+        public bool PreserveSourceLineBreaksFlg { get; set; } = true;
+
+        /// <summary>メニュー「表示」→「箇条書きの記号」の選択状態。falseなら段数に応じて
+        /// 1段目Disc・2段目Circle・3段目以降BoxとするWPF標準の割り当て（既定）、trueなら
+        /// 段数によらずすべての階層で同じ記号（Disc）を使う。既定はfalse。</summary>
+        public bool UniformMarkerStyleFlg { get; set; } = false;
+
+        /// <summary>メニュー「表示」→「表示フォント」の選択状態。falseなら既定の表示フォント
+        /// （Meiryo, Segoe UI。Typoraの実際の描画フォントに合わせた
+        /// 設定。既定）、trueならフォント変更前の以前の表示フォント（Yu Gothic UI, Segoe UI）を
+        /// 使う。既定はfalse。</summary>
+        public bool UseLegacyFontFlg { get; set; } = false;
+
+        /// <summary>メニュー「表示」→「文字の色」の選択状態。falseなら「くっきりした色」（本文は黒。既定）、
+        /// trueなら「目にやさしい色」（本文は少し薄い灰色、リンクも少し薄い青）。既定はfalse。</summary>
+        public bool SoftTextColorFlg { get; set; } = false;
+
+        /// <summary>メニュー「表示」→「表示スタイル」の選択状態。falseなら「GitHubスタイル」（今までの見た目。既定）、
+        /// trueなら「VSCodeスタイル」（Visual Studio Code のプレビューに似せた見た目）。既定はfalse。</summary>
+        public bool UseVsCodeStyleFlg { get; set; } = false;
+
+        /// <summary>メニュー「表示」→「本文の幅」の選択状態。trueなら「読みやすい幅にする（最大 884px）」（本文を最大
+        /// 884px の幅で中央に置く。mdew・mdee と同じ）、falseなら「編集ペインの幅に合わせる」（今までの見た目。既定）。</summary>
+        public bool LimitDocWidthFlg { get; set; } = false;
+
+        /// <summary>メニュー「表示」→「列幅を補正する」のチェック状態（表全体の列幅機能の
+        /// マスタースイッチ）。オンなら、明示的に調整済みの表はその比率で、未調整の表は内容量
+        /// に応じた自動比率で表示する。オフなら両方とも既定の均等幅（Auto）で表示する。
+        /// 既定はtrue。</summary>
+        public bool CorrectColumnWidthsFlg { get; set; } = true;
+        public double PdfMarginTop { get; set; } = 64;
+        public double PdfMarginBottom { get; set; } = 64;
+        public double PdfMarginLeft { get; set; } = 80;
+        public double PdfMarginRight { get; set; } = 80;
+
+        /// <summary>メニュー「表示」→「デバッグログを有効にする」のチェック状態。既定は無効。</summary>
+        public bool DebugLogEnabledFlg { get; set; } = false;
+
+        /// <summary>メニュー「ファイル」→「最近使ったファイル」に表示する、最近開いた/保存した
+        /// ファイルの絶対パス一覧（先頭が最新）。</summary>
+        public List<string> RecentFiles { get; set; } = new List<string>();
+
+        /// <summary>メニュー「ファイル」→「最近使ったフォルダ」に表示する、最近「フォルダを開く」で
+        /// 開いたフォルダの絶対パス一覧（先頭が最新）。</summary>
+        public List<string> RecentFolders { get; set; } = new List<string>();
+
+        /// <summary>「名前を付けて保存」・「PDFに書き出し」のファイル保存ダイアログで、直近に
+        /// ユーザーが実際に選択した保存先フォルダ。現在のファイルの保存先フォルダも表示中の
+        /// フォルダも無い場合に、次回以降のダイアログの初期フォルダとして使う。一度も選択
+        /// されていなければnull（その場合はデスクトップ等を初期フォルダとする）。</summary>
+        public string LastSaveDialogDirectory { get; set; }
+
+        private static string SettingsPath =>
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "mde", "settings.json");
+
+        /// <summary>保存済みの設定を読み込む。ファイルが存在しない、または壊れている場合は
+        /// 既定値を返す。</summary>
+        /// <returns>読み込んだ設定。読み込めなければ既定値の設定。</returns>
+        public static AppSettings Load()
+        {
+            try
+            {
+                if (File.Exists(SettingsPath))
+                {
+                    string json = File.ReadAllText(SettingsPath);
+                    var settings = JsonSerializer.Deserialize<AppSettings>(json);
+                    if (null != settings)
+                    {
+                        return settings;
+                    }
+                }
+            }
+            catch
+            {
+                // 読み込みに失敗しても、既定値で起動を続ける
+            }
+            return new AppSettings();
+        }
+
+        /// <summary>現在の設定をディスクへ保存する。</summary>
+        public void Save()
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(SettingsPath);
+                Directory.CreateDirectory(dir);
+                string json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(SettingsPath, json);
+            }
+            catch
+            {
+                // 保存に失敗しても致命的ではないため、エラーは無視する
+            }
+        }
+    }
+}

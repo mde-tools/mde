@@ -1,0 +1,5397 @@
+﻿// MainWindow.xaml.cs
+//
+// mde (Markdown インラインエディタ) の一部。
+// アプリのメインウィンドウ。ここでは各機能クラス（MarkdownConverter、TableEditor、
+// ListEditor、HeadingCodeBlockEditor、InlineStyleEditor、ImageManager、SearchReplaceService、
+// OutlineManager、FolderTreeManager）をすべて構築し、コンストラクタで必要なdelegateを配線する。
+// XAML側から呼ばれるイベントハンドラの多くは、実際の処理を各クラスへそのまま橋渡しする
+// 薄いラッパーになっている。ウィンドウ全体・現在のファイル・キーボード入力の振り分けといった
+// 「どのクラスにも属さない」調整の役割もここが担う。
+
+using mde.common;
+using mde.dialog;
+using mde.editor;
+using mde.findreplace;
+using mde.logger;
+using mde.manager;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Documents;
+using System.Windows.Input;
+using System.Windows.Media;
+
+namespace mde
+{
+    /// <summary>
+    /// mdeの唯一のメインウィンドウ。1つのRichTextBox（Markdownモード）と1つのプレーンな
+    /// TextBox（ソースモード）を中心に、フォルダペイン・アウトラインペインを備えたWYSIWYG
+    /// Markdownエディタ。実際の編集ロジックは役割ごとに独立したクラスへ委譲している。
+    /// </summary>
+    public partial class MainWindow : Window
+    {
+        // ======================================================================
+        //  状態（フィールド）
+        // ======================================================================
+
+        /// <summary>ソースモード（生テキスト表示）中はtrue。</summary>
+        private bool m_isSourceModeFlg = false;
+
+        /// <summary>ユーザーの入力ではなく、コードによる変更を行っている間だけtrueにするガード
+        /// フラグ。TextChangedハンドラの自動変換ロジックが、プログラムによる変更にまで
+        /// 反応してしまわないようにするためのもの。</summary>
+        private bool m_isProgrammaticChangeFlg = false;
+
+        /// <summary>IME固まり不具合調査用の心拍ログタイマー。ガベージコレクションで消えないよう、
+        /// フィールドとして保持しておく。</summary>
+        private System.Windows.Threading.DispatcherTimer m_imeDebugHeartbeatTimer;
+
+        /// <summary>検索結果のハイライト（背景色）を適用/解除している間だけtrueにするガード
+        /// フラグ。TextChangedがこれを見て、ダーティ扱いにしないようにする。</summary>
+        private bool m_isApplyingHighlightFlg = false;
+
+        /// <summary>アウトラインペインの再構築（ScheduleOutlineRefresh）を間引くためのデバウンス用
+        /// タイマー。フィールドとして保持しGCされないようにする。EditorTextChangedから呼ばれる
+        /// たびにStop()→Start()し直し、最後の編集からInterval経過後に1回だけRefresh()する
+        /// （詳細はScheduleOutlineRefresh参照）。LoadFile・検索置換など連続発生しない呼び出し元は
+        /// 従来通り同期的にm_outlineManager.Refresh()を直接呼ぶ。</summary>
+        private System.Windows.Threading.DispatcherTimer m_outlineRefreshDebounceTimer;
+
+        /// <summary>現在エディタに表示中のファイルの絶対パス。未保存なら null。</summary>
+        private string m_currentFilePath = null;
+
+        /// <summary>currentFilePathの保存先フォルダ（画像の相対パス解決で毎回計算し直さずに
+        /// 済むようキャッシュしている）。</summary>
+        private string m_currentFileDirectory = null;
+
+        /// <summary>まだディスクに書き出されていない、メモリ上だけの編集内容（フォルダ全体の
+        /// 置換、または編集中のファイルから離れた際に発生する）。キー=絶対パス、値=そのファイルの
+        /// 現在のMarkdown内容。</summary>
+        private readonly Dictionary<string, string> m_pendingFileEdits =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>現在のファイル（m_currentFilePath）に未保存の変更があるかどうか。</summary>
+        private bool m_currentFileIsDirtyFlg = false;
+
+        /// <summary>エディタのズーム倍率の管理役。現在の倍率はm_zoomManager.ZoomLevelで
+        /// 参照できる（設定の保存時に使用）。</summary>
+        private ZoomManager m_zoomManager;
+
+        /// <summary>VSCodeスタイルの時、リンクにマウスを乗せている間だけ下線を表示する（ApplyDocStyle で有効・無効を切り替える）。</summary>
+        private LinkHoverUnderline m_linkHoverUnderline;
+
+        /// <summary>編集ペインの文書の上の余白（px。FlowDocument.PagePadding の上。mdew と同じ 24px）。実際の余白は、
+        /// これに文書の先頭の段落の上の余白を足したもの（EditorTopPadding 参照）。</summary>
+        private const double EDITOR_TOP_PADDING = 24;
+
+        /// <summary>文書の先頭の段落（見出し等）の上の余白を、文書の上の余白に足す時の倍率（EditorTopPadding 参照）。</summary>
+        private const double EDITOR_FIRST_BLOCK_MARGIN_RATIO = 0;
+
+        /// <summary>編集ペインの文書の下の余白（px。FlowDocument.PagePadding の下）。末尾までスクロールした時に、最後の行の
+        /// 下に余白を表示する（mdew と同じ 120px）。</summary>
+        private const double EDITOR_BOTTOM_PADDING = 120;
+        private bool m_requireCtrlForLinkClickFlg = true;
+
+        /// <summary>段落中の途中改行（空行を伴わない、ソース上の単純な改行）を、そのまま
+        /// 見た目の改行として表示するか（true。既定値。mde/Typoraの従来動作）、それとも
+        /// 空行が入るまでは改行しない、CommonMark/VSCodeのMarkdownプレビュー標準の表示に
+        /// するか（false）。メニュー「表示」→「段落中の改行」で切り替えられる。</summary>
+        private bool m_preserveSourceLineBreaksFlg = true;
+
+        /// <summary>以前のメニュー「表示」→「列幅を補正する」の状態（メニューは無くしたため、常に true）。オンなら、列幅調整ダイアログで
+        /// 明示的に調整済みの表はその比率で、未調整（|---|）の表は内容量に応じて自動計算した
+        /// 比率で表示する。オフなら、両方とも既定の均等幅（Auto）で表示する（表全体の列幅機能の
+        /// マスタースイッチ）。既定値はtrue。詳細はBlockStyles.ApplyEffectiveColumnWidths参照。</summary>
+        private bool m_correctColumnWidthsFlg = true;
+
+        /// <summary>メニュー「表示」→「箇条書きの記号」の状態。falseなら段数に応じて1段目Disc・
+        /// 2段目Circle・3段目以降BoxとするWPF標準の割り当て（既定）、trueなら段数によらず
+        /// すべての階層で同じ記号（Disc）を使う。詳細はBlockStyles.UnorderedMarkerStyleForDepth
+        /// 参照。既定値はfalse。</summary>
+        private bool m_uniformMarkerStyleFlg = false;
+
+        /// <summary>以前のメニュー「表示」→「表示フォント」の状態（trueなら以前の表示フォント Yu Gothic UI）。メニューは
+        /// 無くしたため、常に false（Meiryo, Segoe UI。mdew・mdee と同じ）。</summary>
+        private bool m_useLegacyFontFlg = false;
+
+        /// <summary>メニュー「表示」→「文字の色」の設定。falseなら「くっきりした色」（既定）、trueなら
+        /// 「目にやさしい色」。詳細はApplyTextColor参照。</summary>
+        private bool m_softTextColorFlg = false;
+
+        /// <summary>メニュー「表示」→「表示スタイル」の設定。falseなら「GitHubスタイル」（既定）、trueなら
+        /// 「VSCodeスタイル」。詳細はSetVsCodeStyleFlg・ApplyDocStyle参照。</summary>
+        private bool m_vsCodeStyleFlg = false;
+
+        /// <summary>メニュー「表示」→「本文の幅」の状態。true＝読みやすい幅（最大 884px で中央に置く。mdew・mdee と同じ）、
+        /// false＝編集ペインの幅に合わせる（今までの見た目。既定）。ApplyDocumentWidth 参照。</summary>
+        private bool m_limitDocWidthFlg = false;
+
+        /// <summary>編集ペイン（RichTextBox）の左右の余白（Padding）の、本来の値（MainWindow.xaml の値。px）。
+        /// 「読みやすい幅にする」の時は、これに本文を中央に置くための余白を足す（ApplyDocumentWidth）。</summary>
+        private Thickness m_editorBasePadding;
+
+        /// <summary>ソースモードの入力欄の、本来の余白（MainWindow.xaml の値。px）。ApplyDocumentWidth 参照。</summary>
+        private Thickness m_sourceEditorBasePadding;
+
+        /// <summary>ウィンドウを閉じる時（WindowClosing）に取得した「元の大きさ」の位置・サイズ
+        /// （GetNormalWindowBounds参照）。OnClosed で設定に保存する。</summary>
+        private Rect? m_normalBoundsAtClosing = null;
+
+        /// <summary>PDF書き出し時の、上下左右の余白（px）。メニュー「PDFの余白を設定…」で
+        /// 変更でき、次回起動時にも復元される。既定値はAppSettingsのものと揃えてある。</summary>
+        private double m_pdfMarginTop = 64;
+        private double m_pdfMarginBottom = 64;
+        private double m_pdfMarginLeft = 80;
+        private double m_pdfMarginRight = 80;
+
+        /// <summary>メニュー「ファイル」→「最近使ったファイル」に表示する、最近開いた/保存した
+        /// ファイルの絶対パス一覧（先頭が最新）。次回起動時にも復元される。FileOperationsManager
+        /// と同じリストを共有する（OnClosedでの設定保存のため、フィールド自体はここに残す）。</summary>
+        private List<string> m_recentFiles = new List<string>();
+
+        /// <summary>メニュー「ファイル」→「最近使ったフォルダ」に表示する、最近「フォルダを開く」で
+        /// 開いたフォルダの絶対パス一覧（先頭が最新）。次回起動時にも復元される。</summary>
+        private List<string> m_recentFolders = new List<string>();
+
+        /// <summary>「最近使ったフォルダ」に残す件数の上限。</summary>
+        private const int MAX_RECENT_FOLDERS = 10;
+
+        /// <summary>「名前を付けて保存」・「PDFに書き出し」ダイアログで、直近にユーザーが実際に
+        /// 選択した保存先フォルダ（次回以降のダイアログの初期フォルダに使う）。次回起動時にも
+        /// 復元される。FileOperationsManagerとdelegate経由で共有する（OnClosedでの設定保存の
+        /// ため、フィールド自体はここに残す）。</summary>
+        private string m_lastSaveDialogDirectory;
+
+        /// <summary>このウィンドウ専用の一時フォルダ識別子（複数ウィンドウを同時に開いた際、
+        /// ドラッグ挿入した画像のファイル名が衝突しないようにするため）。</summary>
+        private readonly string m_instanceTempId = Guid.NewGuid().ToString("N");
+
+        /// <summary>起動時に読み込んだ、前回終了時のウィンドウ状態設定。</summary>
+        private AppSettings m_savedSettings;
+
+        /// <summary>アプリ起動時のコマンドライン引数を使ってよいのは最初の1つのウィンドウだけ、
+        /// という制御のための静的フラグ（プロセス全体で共有される）。</summary>
+        private static bool m_isFirstWindowInstanceFlg = true;
+
+        // フォルダ/アウトラインペインの表示・非表示状態
+        private double m_lastFolderColumnWidth = 190;
+        private double m_lastOutlineColumnWidth = 210;
+        private bool m_folderPaneVisibleFlg = false;
+        private bool m_outlinePaneVisibleFlg = false;
+
+        /// <summary>ステータスバーを表示しているか（メニュー「表示」→「ステータスバーを表示」）。</summary>
+        private bool m_statusBarVisibleFlg = true;
+
+        // 右クリック時の対象（表・コードブロックまわりはTableEditor/InlineStyleEditorに
+        // それぞれ専用のプロパティがあるので、ここではまだどのクラスにも属さないものだけを保持する）
+        private Paragraph m_ctxParagraph;
+
+        // ======================================================================
+        //  各機能クラス（協力オブジェクト）
+        // ======================================================================
+
+        private readonly OriginalTextTracker m_originalTextTracker;
+        /// <summary>見出し・太字・リンク等の意味情報（Tag）を、WPF の Undo／Redo に合わせて戻す役（RunAsProgrammaticChange・
+        /// EditorTextChanged から使う）。</summary>
+        private readonly SemanticUndoTracker m_semanticUndoTracker;
+        private readonly LineEndingTracker m_lineEndingTracker;
+        private readonly ImageManager m_imageManager;
+        private readonly MarkdownConverter m_markdownConverter;
+        private readonly ListEditor m_listEditor;
+        private readonly HeadingCodeBlockEditor m_headingCodeBlockEditor;
+        private readonly TableEditor m_tableEditor;
+        private readonly ClipboardHtmlBuilder m_clipboardHtmlBuilder;
+        private readonly InlineStyleEditor m_inlineStyleEditor;
+        private readonly SearchReplaceService m_searchReplaceService;
+        private readonly OutlineManager m_outlineManager;
+        private readonly FolderTreeManager m_folderTreeManager;
+        private readonly FileOperationsManager m_fileOperationsManager;
+        private readonly FindReplaceLauncher m_findReplaceLauncher;
+
+        /// <summary>
+        /// 既定の（引数なしの）コンストラクタ。App.xamlのStartupUriによりWPFがアプリ起動時に
+        /// リフレクション経由でこのウインドウを生成する際に使われる。XAMLからの生成は
+        /// 実際の型に一致する「引数なしのコンストラクタ」を要求するため、下の
+        /// MainWindow(MainWindow)だけ（引数を省略可能にする書き方）では対応できない
+        /// （引数を省略可能にしても、コンパイル後の型としては引数が1つの
+        /// コンストラクタのままであり、リフレクションからは見つけられずWPFの起動時に
+        /// XamlParseException/MissingMethodExceptionで落ちてしまう。実際にこの問題が
+        /// 起きたため、明示的に引数なしのコンストラクタを分けて用意している）。
+        /// 呼び出し元のウインドウなしで構築する。
+        /// </summary>
+        public MainWindow() : this(null)
+        {
+        }
+
+        /// <summary>ウィンドウを初期化し、各機能クラスを構築・配線したうえで、初回起動時の
+        /// 案内文書を読み込む。</summary>
+        /// <param name="a_openedFromWindow">
+        /// このウインドウが既存の別のウインドウから開かれた場合（「新規作成」・
+        /// 「フォルダペインの範囲外のファイルへのリンク」・「表示中のフォルダの外への
+        /// 名前を付けて保存」・「Readmeを開く」）、その呼び出し元のウインドウ。
+        /// 指定された場合、設定から復元した位置ではなく、そのウインドウから右下へ少し
+        /// （Left・Top それぞれ30px）ずらした位置に表示する。アプリ起動時に開く最初の
+        /// ウインドウ（設定に保存された位置を復元すべきウインドウ）ではnullを渡す
+        /// （上の引数なしのコンストラクタを使う）。
+        /// </param>
+        public MainWindow(MainWindow a_openedFromWindow)
+        {
+            InitializeComponent();
+
+            m_savedSettings = AppSettings.Load();
+            if (!double.IsNaN(m_savedSettings.WindowLeft) && !double.IsNaN(m_savedSettings.WindowTop))
+            {
+                this.WindowStartupLocation = WindowStartupLocation.Manual;
+                this.Left = m_savedSettings.WindowLeft;
+                this.Top = m_savedSettings.WindowTop;
+                // AdjustWindowPositionは、設定に保存された座標が現在のディスプレイ構成
+                // （前回起動時から外部モニタを外した等）で画面外になっていないかを確認する
+                // ためのものなので、位置の設定がある場合にのみ呼ぶ。
+                AdjustWindowPosition();
+            }
+            else
+            {
+                // 新規インストール後の初回起動時など、ウインドウ位置がまだ設定に保存されて
+                // いない場合は、画面の中央に表示する。CenterScreenはLeft/Topが未設定
+                // （NaN）のままである必要があるため、ここではLeft/Topに実際の値を代入しない
+                // （代入するとWPFがCenterScreenでの位置決めをせず、代入した値がそのまま
+                // 使われてしまう）。
+                this.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            }
+            this.Width = m_savedSettings.WindowWidth;
+            this.Height = m_savedSettings.WindowHeight;
+
+            if (null != a_openedFromWindow)
+            {
+                // 別のウインドウから新しく開いたウインドウだとひと目でわかるよう、呼び出し元の
+                // ウインドウから右下へ少しずらした位置に表示する。以前は（設定から復元した
+                // 位置がそのまま使われるため）呼び出し元と全く同じ位置に重なって開いてしまい、
+                // 新しいウインドウが開いたことに気付きにくいというご指摘があった対策。
+                // 設定から復元した位置・AdjustWindowPositionによる画面外対策の結果を上書きする。
+                this.WindowStartupLocation = WindowStartupLocation.Manual;
+                this.Left = a_openedFromWindow.Left + 30;
+                this.Top = a_openedFromWindow.Top + 30;
+            }
+
+            m_zoomManager = new ZoomManager(m_editor, m_sourceEditor, m_zoomLabelBtn, m_savedSettings.ZoomLevel);
+            m_zoomManager.ZoomChangeWrapper = ChangeZoomKeepingTopLine;
+            m_zoomManager.ZoomLevelShown = ShowZoomToast;
+            m_linkHoverUnderline = new LinkHoverUnderline(m_editor);
+            // 文書の上の余白（EditorTopPadding）は、RichTextBox の Padding ではなく FlowDocument の PagePadding に付ける。
+            // Padding の部分はスクロールしない枠の内側の余白になり、スクロールした時に文字がその余白の下端で切れて、編集
+            // ペインの上端から余白の分だけ下で文字が欠けて見えるため（PagePadding は文書と一緒にスクロールする。mdew と同じ）。
+            // 下も同じく PagePadding に余白（EDITOR_BOTTOM_PADDING）を付ける。左右は RichTextBox の既定のまま（未設定なら自動）にする。
+            // RichTextBox は、表示の準備をする時（コンストラクタより後）に PagePadding を自分の既定値に設定し直すことが
+            // あるため、ここで設定するだけでなく、PagePadding が変わるたびに上下の余白を付け直す（ApplyEditorTopPadding）。
+            ApplyEditorTopPadding();
+            System.ComponentModel.DependencyPropertyDescriptor
+                .FromProperty(FlowDocument.PagePaddingProperty, typeof(FlowDocument))
+                .AddValueChanged(m_editorDocument, (s, e) => ApplyEditorTopPadding());
+            m_editor.Loaded += (s, e) => ApplyEditorTopPadding();
+            // 文書の先頭の段落が変わったら（見出し⇔本文等）、上の余白を付け直す（EditorTopPadding 参照）
+            m_editor.TextChanged += (s, e) => ApplyEditorTopPadding();
+            // 線の描き方（ApplyEditorEdgeMode）は、編集ペインのスクロール領域ができてから付ける
+            m_editor.Loaded += (s, e) => ApplyEditorEdgeMode();
+            m_requireCtrlForLinkClickFlg = m_savedSettings.RequireCtrlForLinkClickFlg;
+            m_preserveSourceLineBreaksFlg = m_savedSettings.PreserveSourceLineBreaksFlg;
+            // メニュー「表示」→「列幅を補正する」は無くした（mdew・mdee と同じく、表の列幅は常に内容に合わせる）。以前の版で
+            // オフにして保存した設定は使わない
+            m_correctColumnWidthsFlg = true;
+            m_uniformMarkerStyleFlg = m_savedSettings.UniformMarkerStyleFlg;
+            // メニュー「表示」→「表示フォント」は無くした（mdew・mdee と同じ Meiryo だけにする）。以前の版で「以前のフォント」を
+            // 選んで保存した設定は使わない
+            m_useLegacyFontFlg = false;
+            m_softTextColorFlg = m_savedSettings.SoftTextColorFlg;
+            m_vsCodeStyleFlg = m_savedSettings.UseVsCodeStyleFlg;
+            m_limitDocWidthFlg = m_savedSettings.LimitDocWidthFlg;
+            m_editorBasePadding = m_editor.Padding;
+            m_sourceEditorBasePadding = m_sourceEditor.Padding;
+            // ソースモードの入力欄は表示倍率を文字の大きさで表すため（ZoomManager.SetZoom）、幅が変わった時に加えて、
+            // 倍率を変えた時（ChangeZoomKeepingTopLine）にも本文の幅を合わせ直す
+            m_sourceEditor.SizeChanged += (s, e) => ApplyDocumentWidth();
+            // 表示スタイルに合わせて、表示フォント・文字の色・行の間隔等をまとめて反映する（文書を
+            // 読み込む前に BlockStyles.VsCodeStyleFlg を設定しておく必要がある）。
+            ApplyDocStyle();
+            m_debugLogMenuItem.IsChecked = m_savedSettings.DebugLogEnabledFlg;
+            DebugLogger.SetEnabled(m_savedSettings.DebugLogEnabledFlg);
+            m_pdfMarginTop = m_savedSettings.PdfMarginTop > 0 ? m_savedSettings.PdfMarginTop : 64;
+            m_pdfMarginBottom = m_savedSettings.PdfMarginBottom > 0 ? m_savedSettings.PdfMarginBottom : 64;
+            m_pdfMarginLeft = m_savedSettings.PdfMarginLeft > 0 ? m_savedSettings.PdfMarginLeft : 80;
+            m_pdfMarginRight = m_savedSettings.PdfMarginRight > 0 ? m_savedSettings.PdfMarginRight : 80;
+            m_recentFiles = null != m_savedSettings.RecentFiles ? new List<string>(m_savedSettings.RecentFiles) : new List<string>();
+            m_recentFolders = null != m_savedSettings.RecentFolders ? new List<string>(m_savedSettings.RecentFolders) : new List<string>();
+            m_lastSaveDialogDirectory = m_savedSettings.LastSaveDialogDirectory;
+            // 「最近使ったファイル」サブメニューの初回構築はFileOperationsManager構築後
+            // （このコンストラクタの後半）で行う（RebuildRecentFilesMenu呼び出し箇所を参照）。
+            UpdateLinkModeMenuChecks();
+            UpdateLineBreakModeMenuChecks();
+            UpdateMarkerStyleMenuChecks();
+            UpdateTextColorMenuChecks();
+            UpdateDocStyleMenuChecks();
+            UpdateDocWidthMenuChecks();
+            m_folderPaneVisibleFlg = m_savedSettings.FolderPaneVisible;
+            m_outlinePaneVisibleFlg = m_savedSettings.OutlinePaneVisible;
+            m_statusBarVisibleFlg = m_savedSettings.StatusBarVisible;
+            m_statusBar.Visibility = m_statusBarVisibleFlg ? Visibility.Visible : Visibility.Collapsed;
+            if (m_savedSettings.FolderPaneWidth > 0)
+            {
+                m_lastFolderColumnWidth = m_savedSettings.FolderPaneWidth;
+            }
+            if (m_savedSettings.OutlinePaneWidth > 0)
+            {
+                m_lastOutlineColumnWidth = m_savedSettings.OutlinePaneWidth;
+            }
+
+            m_originalTextTracker = new OriginalTextTracker(m_editor);
+            m_semanticUndoTracker = new SemanticUndoTracker(m_editor);
+            m_lineEndingTracker = new LineEndingTracker(PathsReferToSameFile);
+            // GetMarkdownOffsetForBlockはクロージャで渡す：m_markdownConverterはこの後で構築
+            // されるが、実際に呼ばれるのは構築完了後（見出しクリック時）なので問題ない。
+            m_outlineManager = new OutlineManager(
+                m_editor, m_sourceEditor, () => m_isSourceModeFlg,
+                (doc, block) => m_markdownConverter.GetMarkdownOffsetForBlock(doc, block), m_outlineTree);
+            m_imageManager = new ImageManager(
+                m_editor, m_originalTextTracker, () => m_isSourceModeFlg, () => m_currentFileDirectory,
+                () => m_currentFilePath,
+                RunAsProgrammaticChange, m_outlineManager.Refresh, m_instanceTempId);
+            // 表の表示幅（() => m_tableEditor.GetAvailableTableWidth()）もクロージャで渡す：
+            // m_tableEditorはこの後で構築されるが、呼ばれるのは構築完了後なので問題ない。
+            m_markdownConverter = new MarkdownConverter(
+                m_originalTextTracker, m_imageManager, () => m_preserveSourceLineBreaksFlg,
+                () => m_correctColumnWidthsFlg, () => m_tableEditor.GetAvailableTableWidth(),
+                () => m_uniformMarkerStyleFlg);
+            m_listEditor = new ListEditor(m_editor, m_originalTextTracker, RunAsProgrammaticChange,
+                () => m_uniformMarkerStyleFlg);
+            m_headingCodeBlockEditor = new HeadingCodeBlockEditor(m_editor, m_originalTextTracker, RunAsProgrammaticChange, m_semanticUndoTracker);
+            m_tableEditor = new TableEditor(
+                m_editor, m_originalTextTracker, MarkDirty, RunAsProgrammaticChange, () => m_isSourceModeFlg,
+                m_outlineManager.Refresh, InsertPlainTextWithLineBreaksForCodeBlock, () => m_correctColumnWidthsFlg,
+                m_imageManager);
+            m_clipboardHtmlBuilder = new ClipboardHtmlBuilder(m_editor, m_imageManager, m_tableEditor, () => m_isSourceModeFlg);
+            m_folderTreeManager = new FolderTreeManager(
+                LoadFile, () => m_currentFilePath, () => m_currentFileIsDirtyFlg,
+                () => m_pendingFileEdits.Keys, PathsReferToSameFile, m_folderTree,
+                DiscardCurrentDocumentSilently);
+            m_inlineStyleEditor = new InlineStyleEditor(
+                m_editor, m_originalTextTracker, RunAsProgrammaticChange, MarkDirty, m_outlineManager.Refresh,
+                m_markdownConverter.BlockToMarkdown, () => m_currentFileDirectory, LoadFile,
+                m_folderTreeManager.IsWithinLoadedFolder, OpenFileInNewWindow, () => m_requireCtrlForLinkClickFlg);
+            m_searchReplaceService = new SearchReplaceService(
+                m_editor, m_sourceEditor, m_markdownConverter, m_originalTextTracker, m_lineEndingTracker,
+                () => m_isSourceModeFlg, RunAsProgrammaticChange, m_outlineManager.Refresh, p => OutlineManager.ScrollParagraphToTop(p, m_editor),
+                () => m_folderTreeManager.LoadedFolderRootPath, GetCurrentContentForFile,
+                SetFileContentForReplaceImpl, LoadFile, RunWithoutDirtyMarking, m_outlineManager.MarkSearchMatches,
+                m_outlineManager.SelectHeadingForPosition);
+            m_findReplaceLauncher = new FindReplaceLauncher(() => new FindReplaceWindow(this) { Owner = this });
+            m_fileOperationsManager = new FileOperationsManager(
+                m_editor, m_sourceEditor, m_markdownConverter, m_imageManager, m_lineEndingTracker,
+                m_outlineManager, m_folderTreeManager, m_searchReplaceService, m_recentFilesMenu,
+                m_recentFiles, m_pendingFileEdits,
+                () => m_isSourceModeFlg, () => m_preserveSourceLineBreaksFlg, () => m_correctColumnWidthsFlg,
+                RunAsProgrammaticChange, GetCurrentContentForFile, PathsReferToSameFile,
+                RememberCurrentScrollPosition, RestoreOrResetScrollPosition, OpenFileInNewWindow,
+                () => { var newWindow = new MainWindow(this); newWindow.Show(); }, Close,
+                title => this.Title = title, () => m_findReplaceLauncher.CurrentWindow,
+                () => m_currentFilePath, v => m_currentFilePath = v,
+                () => m_currentFileDirectory, v => m_currentFileDirectory = v,
+                () => m_currentFileIsDirtyFlg, v => m_currentFileIsDirtyFlg = v,
+                () => m_lastSaveDialogDirectory, v => m_lastSaveDialogDirectory = v,
+                OpensInNewWindow);
+            // 「最近使ったファイル」サブメニューの初回構築（設定から読み込んだm_recentFilesの
+            // 内容を反映する）。FileOperationsManagerの構築後に行う必要がある。
+            m_fileOperationsManager.RebuildRecentFilesMenu();
+            RebuildRecentFoldersMenu();
+
+            this.Title = Assembly.GetExecutingAssembly().GetName().Name + " v" + Assembly.GetExecutingAssembly().GetName().Version;
+            m_outlineTree.ItemsSource = m_outlineManager.Items;
+            m_folderTree.ItemsSource = m_folderTreeManager.Roots;
+            // Excel向けのコピー形式（TSV・CF_HTML）は、以前はCtrl+C自体をDataObject.
+            // AddCopyingHandlerで乗っ取って自動生成していたが、その結果クリップボードに
+            // HTML形式（<table>を含む）が常時載るようになり、mde同士でのCtrl+C→Ctrl+V（本来
+            // Xaml/Rtf形式で構造をそのまま復元するはずの貼り付け）まで、TableEditor.
+            // HandlePastingの「HTMLに<table>があれば表として解釈する」分岐に誤って捕まって
+            // しまい、画像等が失われる形で壊れてしまうことが実機で判明した（詳細はDEVELOPMENT_
+            // LOG.md参照）。Ctrl+Cは元通りWPF標準のコピー（Xaml/Rtf/Text）に戻し、Excel向けの
+            // コピーは右クリックメニュー「Excel用にコピー」（CopyForExcelItemClick）から明示的に
+            // 呼び出す方式に変更した。TableEditor.TryCopySelectionForExcel・
+            // ClipboardHtmlBuilder.TryCopySelectionForExcelが、それぞれのHandleCopyingが
+            // 持っていた組み立てロジックをそのまま引き継いでいる。
+            // 画像貼り付けハンドラを表・テキスト向けハンドラより先に登録する：ブラウザ等から
+            // コピーした画像はHTML/テキストも同時に持つことがあるため、画像なら他に渡る前に
+            // ここで処理する（詳細はEditorHandleInlineMarkdownPasting参照）。
+            // mde どうしのコピー・貼り付け（EditorHandleMdeMarkdownPasting）は、他のどのハンドラよりも先に処理する。
+            DataObject.AddPastingHandler(m_editor, EditorHandleMdeMarkdownPasting);
+            DataObject.AddPastingHandler(m_editor, m_imageManager.HandlePasting);
+            // 書式付きの HTML（Claude・Web ページ・Word 等）は、表だけの HTML 用の TableEditor.HandlePasting より先に
+            // 処理する（表を含む文章全体が、表だけとして貼られないように。EditorHandleHtmlPasting参照）。
+            DataObject.AddPastingHandler(m_editor, EditorHandleHtmlPasting);
+            DataObject.AddPastingHandler(m_editor, m_tableEditor.HandlePasting);
+            DataObject.AddPastingHandler(m_editor, EditorHandleInlineMarkdownPasting);
+            // コピー・切り取りした文字から、リンクの URL の折り返し用の見えない文字を取り除く（EditorHandleCopying）
+            DataObject.AddCopyingHandler(m_editor, EditorHandleCopying);
+            // EditorPreviewKeyDown が処理しなかったキー（WPF 標準の処理に任せるキー）だけを受け取る
+            // （EditorPreviewKeyDownUnhandled。XAML で付けた EditorPreviewKeyDown より後に呼ばれる）
+            m_editor.AddHandler(UIElement.PreviewKeyDownEvent, new KeyEventHandler(EditorPreviewKeyDownUnhandled), false);
+
+            // タスクリストのチェックボックス（[ ]/[x]）のトグルを検知する。埋め込まれた各
+            // CheckBoxに個別のハンドラを付けるのではなく、ToggleButton.CheckedEvent/
+            // UncheckedEventがルーティングイベントとしてm_editorまでバブリングしてくることを
+            // 利用し、m_editor自身に登録した単一のハンドラでまとめて受け取る。
+            m_editor.AddHandler(ToggleButton.CheckedEvent, new RoutedEventHandler(TaskCheckboxToggled));
+            m_editor.AddHandler(ToggleButton.UncheckedEvent, new RoutedEventHandler(TaskCheckboxToggled));
+            // 表の中を編集してキャレットが表の外へ出た時に、その表の列幅を内容に合わせ直す（RefreshTableWidthsOnLeave）
+            m_editor.SelectionChanged += (s, e) => RefreshTableWidthsOnLeave();
+
+            // IME固まり調査用デバッグログ：フォーカス移動とIME入力（変換中含む）を時系列で記録する。
+            m_editor.GotKeyboardFocus += (a_s, a_e) =>
+                DebugLogger.Log($"Editor.GotKeyboardFocus: Old={a_e.OldFocus} New={a_e.NewFocus}");
+            m_editor.LostKeyboardFocus += (a_s, a_e) =>
+                DebugLogger.Log($"Editor.LostKeyboardFocus: Old={a_e.OldFocus} New={a_e.NewFocus} " +
+                    $"ForegroundWindow={DebugLogger.DescribeForegroundWindow()}");
+            // メッセージ文字列の組み立ては、DebugLogger.IsEnabledがfalseでも評価されてしまう
+            // ため、キー入力のたびに呼ばれるハンドラでは無効時に組み立てごと省略する。
+            m_editor.PreviewTextInput += (a_s, a_e) =>
+            {
+                if (!DebugLogger.IsEnabled) return;
+                DebugLogger.Log(
+                    $"Editor.PreviewTextInput: Text=\"{a_e.Text}\" " +
+                    $"CompositionText=\"{a_e.TextComposition?.CompositionText}\" " +
+                    $"SystemCompositionText=\"{a_e.TextComposition?.SystemCompositionText}\" " +
+                    $"ControlText=\"{a_e.TextComposition?.ControlText}\"");
+            };
+            m_editor.TextInput += (a_s, a_e) =>
+            {
+                if (!DebugLogger.IsEnabled) return;
+                DebugLogger.Log(
+                    $"Editor.TextInput: Text=\"{a_e.Text}\" " +
+                    $"CompositionText=\"{a_e.TextComposition?.CompositionText}\"");
+            };
+
+            // IME固まり調査用の心拍ログ：イベントが発生しない無音期間もあるため、一定間隔で
+            // フォーカス状態とフォアグラウンドウィンドウを強制的に記録する。
+            m_imeDebugHeartbeatTimer = new System.Windows.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(500)
+            };
+            m_imeDebugHeartbeatTimer.Tick += (a_s, a_e) =>
+            {
+                // 無効時はメッセージの組み立て（フォアグラウンドウィンドウの問い合わせ等）ごと省略する。
+                if (!DebugLogger.IsEnabled) return;
+                DebugLogger.Log(
+                    $"heartbeat: EditorIsFocused={m_editor.IsFocused} " +
+                    $"EditorIsKeyboardFocused={m_editor.IsKeyboardFocused} " +
+                    $"Keyboard.FocusedElement={Keyboard.FocusedElement} " +
+                    $"WindowIsActive={this.IsActive} " +
+                    $"ForegroundWindow={DebugLogger.DescribeForegroundWindow()} " +
+                    $"IsInputMethodEnabled={InputMethod.GetIsInputMethodEnabled(m_editor)} " +
+                    $"CurrentInputLanguage={InputLanguageManager.Current?.CurrentInputLanguage?.Name} " +
+                    $"CanUndo={m_editor.CanUndo} CanRedo={m_editor.CanRedo}");
+            };
+            m_imeDebugHeartbeatTimer.Start();
+
+            // アウトラインペイン再構築（ScheduleOutlineRefresh）のデバウンス用タイマー。
+            // Interval分だけEditorTextChangedが発生しなければ1回だけTickが呼ばれる
+            // （呼ばれるたびScheduleOutlineRefresh側でStop()→Start()し直すため）。
+            m_outlineRefreshDebounceTimer = new System.Windows.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(400)
+            };
+            m_outlineRefreshDebounceTimer.Tick += (a_s, a_e) =>
+            {
+                m_outlineRefreshDebounceTimer.Stop();
+                m_outlineManager.Refresh();
+            };
+
+            // 起動時引数でパスを受け取っていれば、そちらを開く（ファイルの関連付けからの
+            // ダブルクリック起動や、エクスプローラーの右クリックメニュー「mdeで開く」に
+            // 対応するため）。ファイルなら通常どおり開き、フォルダなら「フォルダを開く」と
+            // 同様にフォルダビューへ読み込んで先頭のファイルを開く（フォルダの背景を右クリック
+            // して「mdeで開く」を実行した場合など）。フォルダビューが非表示設定だった場合も、
+            // せっかく指定されたフォルダが見えないままでは意味が無いため、ここで表示状態に
+            // 切り替える（実際にXAMLへ反映されるのは直後のApplyFolderPaneVisibility）。
+            string startupPath = ResolveStartupPath();
+            if (!string.IsNullOrEmpty(startupPath) && File.Exists(startupPath))
+            {
+                LoadFile(startupPath);
+                m_folderTreeManager.SelectFileNode(startupPath);
+            }
+            else if (!string.IsNullOrEmpty(startupPath) && Directory.Exists(startupPath))
+            {
+                m_folderPaneVisibleFlg = true;
+                m_folderTreeManager.LoadFolderTree(startupPath);
+                m_folderTreeManager.OpenFirstFileInLoadedFolder();
+                AddToRecentFolders(startupPath);
+            }
+
+            ApplyFolderPaneVisibility();
+            ApplyOutlinePaneVisibility();
+            m_zoomManager.ApplyCurrentZoomLevel();
+            if (m_savedSettings.IsMaximized)
+            {
+                this.WindowState = WindowState.Maximized;
+            }
+        }
+
+        /// <summary>
+        /// メインウインドウの表示座標が無効ならx=0/y=0に移動します
+        /// この処理は、マルチウインドウ環境でサブディスプレイを切断した状態で
+        /// アプリを起動した場合ウインドウが表示できなくなる問題に対処するものです
+        /// </summary>
+        private void AdjustWindowPosition()
+        {
+            bool isMainWindowVisibleFlg = false;
+
+            System.Diagnostics.Debug.WriteLine($"AdjustWindowPosition: Current Window Position = L:{this.Left}, T:{this.Top}");
+
+            foreach (var workingArea in GetDisplayWorkingAreas())
+            {
+                double windowX = this.Left;
+                double windowY = this.Top;
+
+                // ウィンドウの左上座標がワーキングエリア内にあるかチェック
+                if (windowX >= workingArea.Left && windowX < workingArea.Right &&
+                    windowY >= workingArea.Top && windowY < workingArea.Bottom)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Window position is valid in area: L:{workingArea.Left}, T:{workingArea.Top}, R:{workingArea.Right}, B:{workingArea.Bottom}");
+                    isMainWindowVisibleFlg = true;
+                    break;
+                }
+            }
+
+            if (!isMainWindowVisibleFlg)
+            {
+                System.Diagnostics.Debug.WriteLine("Window position is invalid, moving to (0, 0)");
+                this.Top = 0;
+                this.Left = 0;
+            }
+        }
+
+        /// <summary>
+        /// Win32 P/Invoke を使用して、各ディスプレイのワーキングエリアを取得します。
+        /// System.Windows.Forms に依存せずにマルチモニター情報を列挙します。
+        /// </summary>
+        /// <returns>各モニターのワーキングエリア (Rect) を含むリスト。</returns>
+        private List<Rect> GetDisplayWorkingAreas()
+        {
+            var workingAreas = new List<Rect>();
+
+            bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdcMonitor, ref Rect32 lprcMonitor, IntPtr dwData)
+            {
+                var monitorInfo = new MonitorInfo { m_cbSize = Marshal.SizeOf<MonitorInfo>() };
+                if (GetMonitorInfo(hMonitor, ref monitorInfo))
+                {
+                    // Rect32 (int型) を WPF の Rect (double型) に変換
+                    var workingArea = new Rect(
+                        monitorInfo.m_rcWork.m_left,
+                        monitorInfo.m_rcWork.m_top,
+                        monitorInfo.m_rcWork.m_right - monitorInfo.m_rcWork.m_left,
+                        monitorInfo.m_rcWork.m_bottom - monitorInfo.m_rcWork.m_top
+                    );
+                    workingAreas.Add(workingArea);
+                    System.Diagnostics.Debug.WriteLine($"Monitor: rcWork=[L:{monitorInfo.m_rcWork.m_left}, T:{monitorInfo.m_rcWork.m_top}, R:{monitorInfo.m_rcWork.m_right}, B:{monitorInfo.m_rcWork.m_bottom}]");
+                }
+                return true;
+            }
+
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, MonitorEnumProc, IntPtr.Zero);
+            return workingAreas;
+        }
+
+        /// <summary>
+        /// ウィンドウの「元の大きさ」の位置・サイズ（最大化・最小化・画面の端へのスナップ・ディスプレイの高さ
+        /// いっぱいへの拡大をする前の位置・サイズ）を、WPFの座標（論理単位）で返す。スナップした状態では
+        /// Left/Top/Width/Height がスナップ後の位置・サイズになっているため、Win32 の GetWindowPlacement の
+        /// rcNormalPosition を使う。rcNormalPosition は、ウィンドウがあるモニターの作業領域（タスクバーを
+        /// 除いた領域）を基準にした座標なので、画面の座標に直してから論理単位に変換する。
+        /// </summary>
+        /// <returns>位置・サイズ。取得できなかった場合は null。</returns>
+        private Rect? GetNormalWindowBounds()
+        {
+            IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            var placement = new WindowPlacement { m_length = Marshal.SizeOf<WindowPlacement>() };
+            if (IntPtr.Zero == hwnd ||
+                !GetWindowPlacement(hwnd, ref placement))
+            {
+                return null;
+            }
+            Rect32 r = placement.m_rcNormalPosition;
+            if (r.m_right - r.m_left <= 0 ||
+                r.m_bottom - r.m_top <= 0)
+            {
+                return null;
+            }
+            // 作業領域を基準にした座標 → 画面の座標
+            int offsetX = 0;
+            int offsetY = 0;
+            var monitorInfo = new MonitorInfo { m_cbSize = Marshal.SizeOf<MonitorInfo>() };
+            IntPtr hMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if (IntPtr.Zero != hMonitor &&
+                GetMonitorInfo(hMonitor, ref monitorInfo))
+            {
+                offsetX = monitorInfo.m_rcWork.m_left - monitorInfo.m_rcMonitor.m_left;
+                offsetY = monitorInfo.m_rcWork.m_top - monitorInfo.m_rcMonitor.m_top;
+            }
+            // 画面の座標（ピクセル） → WPFの座標（論理単位）
+            Matrix fromDevice = PresentationSource.FromVisual(this)?.CompositionTarget?.TransformFromDevice ?? Matrix.Identity;
+            Point topLeft = fromDevice.Transform(new Point(r.m_left + offsetX, r.m_top + offsetY));
+            Point bottomRight = fromDevice.Transform(new Point(r.m_right + offsetX, r.m_bottom + offsetY));
+            return new Rect(topLeft, bottomRight);
+        }
+
+        /// <summary>Win32 API GetWindowPlacement（ウィンドウの表示状態と「元の大きさ」の位置・サイズを取得）。</summary>
+        /// <param name="a_hWnd">ウィンドウのハンドル。</param>
+        /// <param name="a_lpwndpl">結果を受け取る WINDOWPLACEMENT 構造体（m_length を設定しておくこと）。</param>
+        /// <returns>成功した場合は true。</returns>
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowPlacement(IntPtr a_hWnd, ref WindowPlacement a_lpwndpl);
+
+        /// <summary>Win32 API MonitorFromWindow（ウィンドウがあるモニターのハンドルを取得）。</summary>
+        /// <param name="a_hWnd">ウィンドウのハンドル。</param>
+        /// <param name="a_dwFlags">ウィンドウがどのモニターにも重なっていない場合の扱い。</param>
+        /// <returns>モニターのハンドル。</returns>
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromWindow(IntPtr a_hWnd, uint a_dwFlags);
+
+        /// <summary>MonitorFromWindow：いちばん近いモニターを返す。</summary>
+        private const uint MONITOR_DEFAULTTONEAREST = 2;
+
+        /// <summary>Windows WINDOWPLACEMENT 構造体 (P/Invoke 用)。</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WindowPlacement
+        {
+            public int m_length;
+            public int m_flags;
+            public int m_showCmd;
+            public int m_ptMinPositionX;
+            public int m_ptMinPositionY;
+            public int m_ptMaxPositionX;
+            public int m_ptMaxPositionY;
+            public Rect32 m_rcNormalPosition;
+        }
+
+        /// <summary>
+        /// Win32 API EnumDisplayMonitors をラップする P/Invoke 宣言。
+        /// すべてのディスプレイモニターにつき、コールバック関数を呼び出します。
+        /// </summary>
+        /// <param name="a_hdc">デバイスコンテキスト (通常は IntPtr.Zero)。</param>
+        /// <param name="a_lprcClip">クリップ矩形への ポインタ (通常は IntPtr.Zero)。</param>
+        /// <param name="a_lpfnEnum">各モニターに対して呼び出されるコールバック関数。</param>
+        /// <param name="a_dwData">コールバック関数に渡されるアプリケーション定義データ。</param>
+        /// <returns>列挙が完了したら true を返します。</returns>
+        [DllImport("user32.dll")]
+        private static extern bool EnumDisplayMonitors(IntPtr a_hdc, IntPtr a_lprcClip, MonitorEnumDelegate a_lpfnEnum, IntPtr a_dwData);
+
+        /// <summary>
+        /// EnumDisplayMonitors のコールバック関数の署名を定義します。
+        /// モニターごとに呼び出され、モニター情報を処理します。
+        /// </summary>
+        /// <param name="a_hMonitor">モニターのハンドル。</param>
+        /// <param name="a_hdcMonitor">モニターのデバイスコンテキスト。</param>
+        /// <param name="a_lprcMonitor">モニターの画面座標を示す矩形への参照。</param>
+        /// <param name="a_dwData">アプリケーション定義データ (EnumDisplayMonitors に渡されたもの)。</param>
+        /// <returns>列挙を継続する場合は true、停止する場合は false を返します。</returns>
+        private delegate bool MonitorEnumDelegate(IntPtr a_hMonitor, IntPtr a_hdcMonitor, ref Rect32 a_lprcMonitor, IntPtr a_dwData);
+
+        /// <summary>
+        /// Win32 API GetMonitorInfo をラップする P/Invoke 宣言。
+        /// モニターハンドルから詳細なモニター情報を取得します。
+        /// </summary>
+        /// <param name="a_hMonitor">モニターのハンドル。</param>
+        /// <param name="a_lpmi">MONITORINFO 構造体への参照。</param>
+        /// <returns>関数が成功した場合は true、失敗した場合は false を返します。</returns>
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern bool GetMonitorInfo(IntPtr a_hMonitor, ref MonitorInfo a_lpmi);
+
+        /// <summary>
+        /// Windows RECT 構造体 (P/Invoke 用)。
+        /// int 型のメンバでメモリレイアウトを正確に表現します。
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Rect32
+        {
+            /// <summary>矩形の左座標。</summary>
+            public int m_left;
+            /// <summary>矩形の上座標。</summary>
+            public int m_top;
+            /// <summary>矩形の右座標。</summary>
+            public int m_right;
+            /// <summary>矩形の下座標。</summary>
+            public int m_bottom;
+        }
+
+        /// <summary>
+        /// Windows MONITORINFO 構造体 (P/Invoke 用)。
+        /// モニターの画面座標、ワーキングエリア、およびフラグ情報を保持します。
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MonitorInfo
+        {
+            /// <summary>
+            /// 構造体のサイズ (バイト単位)。
+            /// GetMonitorInfo 呼び出し前に Marshal.SizeOf&lt;MonitorInfo&gt;() で初期化する必要があります。
+            /// </summary>
+            public int m_cbSize;
+
+            /// <summary>
+            /// モニターの画面座標を示す矩形 (仮想スクリーン座標系)。
+            /// </summary>
+            public Rect32 m_rcMonitor;
+
+            /// <summary>
+            /// モニターのワーキングエリア (タスクバーなどを除いた領域) を示す矩形。
+            /// ウィンドウの有効表示範囲を判定する際に使用されます。
+            /// </summary>
+            public Rect32 m_rcWork;
+
+            /// <summary>
+            /// モニターフラグ。
+            /// 0x1 (MONITORINFOF_PRIMARY) の場合、プライマリディスプレイです。
+            /// </summary>
+            public uint m_dwFlags;
+        }
+
+        /// <summary>ウィンドウを閉じようとした時、未保存の変更があれば「…は変更されています。閉じる前に保存しますか？」
+        /// （はい・いいえ・キャンセル。既定は「はい」）を確認する。はい：保存してから閉じる（保存先の選択をキャンセル
+        /// した・保存に失敗した時は閉じない。FileOperationsManager.SaveForClose）。いいえ：保存せずに閉じる。
+        /// キャンセル：閉じない。メッセージには、変更されているファイルの名前を出す（多い時は4個まで出して、
+        /// 残りは「ほか n 個のファイル」）。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void WindowClosing(object a_sender, System.ComponentModel.CancelEventArgs a_args)
+        {
+            // 次回起動時に復元する「元の大きさ」の位置・サイズは、ここ（ウィンドウがまだ破棄されていない
+            // 時点）で取得しておく。OnClosed の時点ではウィンドウのハンドルが既に破棄されていて取得できない。
+            m_normalBoundsAtClosing = GetNormalWindowBounds();
+            if (!m_currentFileIsDirtyFlg && 0 == m_pendingFileEdits.Count)
+            {
+                return;
+            }
+            var names = new List<string>();
+            if (m_currentFileIsDirtyFlg)
+            {
+                names.Add(string.IsNullOrEmpty(m_currentFilePath) ? "(無題)" : System.IO.Path.GetFileName(m_currentFilePath));
+            }
+            foreach (string path in m_pendingFileEdits.Keys)
+            {
+                if (!string.Equals(path, m_currentFilePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    names.Add(System.IO.Path.GetFileName(path));
+                }
+            }
+            var lines = new System.Text.StringBuilder();
+            for (int i = 0; i < names.Count; i++)
+            {
+                if (4 == i && 5 < names.Count)
+                {
+                    lines.Append($"ほか {names.Count - 4} 個のファイル\n");
+                    break;
+                }
+                lines.Append(names[i]).Append('\n');
+            }
+            MessageBoxResult result = MessageBox.Show(this, lines + "は変更されています。閉じる前に保存しますか？",
+                "mde", MessageBoxButton.YesNoCancel, MessageBoxImage.Question, MessageBoxResult.Yes);
+            if (MessageBoxResult.Yes == result)
+            {
+                if (!m_fileOperationsManager.SaveForClose())
+                {
+                    a_args.Cancel = true;
+                }
+            }
+            else if (MessageBoxResult.No != result)
+            {
+                a_args.Cancel = true;
+            }
+        }
+
+        /// <summary>
+        /// 起動時のコマンドライン引数からパスを取り出す。ファイルの関連付けで「開く」・
+        /// 「プログラムから開く」・エクスプローラーの右クリックメニュー「mdeで開く」を使った
+        /// 場合（ファイル・フォルダのいずれも）や、コマンドプロンプトから直接パスを指定して
+        /// 起動した場合などに対応するためのもの。呼び出し側で、ファイルかフォルダかを
+        /// 判定して扱いを分ける（コンストラクタ内の呼び出し箇所参照）。引数が無ければ
+        /// nullを返す。
+        /// </summary>
+        /// <returns>解決できた絶対パス（ファイル・フォルダいずれもあり得る）。引数が無い、
+        /// または解決に失敗した場合はnull。</returns>
+        private string ResolveStartupPath()
+        {
+            // 起動時引数は、プロセス全体で共通の情報であり、ウィンドウ単位のものではない。
+            // 「新規作成」やファイルリンクからの別ウィンドウ起動でも同じ引数が
+            // 見えてしまうため、最初の1つのウィンドウでだけ使うようにする。
+            if (!m_isFirstWindowInstanceFlg)
+            {
+                return null;
+            }
+            m_isFirstWindowInstanceFlg = false;
+
+            try
+            {
+                string[] args = Environment.GetCommandLineArgs();
+                // args[0]は実行ファイル自身のパスなので、実際の引数はargs[1]以降になる。
+                if (args.Length < 2 || string.IsNullOrWhiteSpace(args[1]))
+                {
+                    return null;
+                }
+                return Path.GetFullPath(args[1]);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>ウィンドウを閉じる際、このウィンドウ専用の一時画像フォルダを削除し、
+        /// 次回起動時に復元するウィンドウ状態を保存する。</summary>
+        /// <param name="a_args">イベントの引数。</param>
+        protected override void OnClosed(EventArgs a_args)
+        {
+            base.OnClosed(a_args);
+            try
+            {
+                string dir = Path.Combine(Path.GetTempPath(), "mde", m_instanceTempId);
+                if (Directory.Exists(dir))
+                {
+                    Directory.Delete(dir, true);
+                }
+            }
+            catch
+            {
+                // 削除できなくても致命的ではない（ベストエフォート）
+            }
+
+            bool maximizedFlg = this.WindowState == WindowState.Maximized;
+            // 保存する位置・サイズは「元の大きさ」（最大化・スナップする前の位置・サイズ）にする。画面の端へ
+            // スナップした状態や、ディスプレイの高さいっぱいに広げた状態で閉じた場合も、次回はスナップする前の
+            // 位置・サイズで開く（mdew と同じ）。取得できない場合は今までどおり。
+            Rect bounds = m_normalBoundsAtClosing
+                ?? (maximizedFlg ? this.RestoreBounds : new Rect(this.Left, this.Top, this.Width, this.Height));
+            // 表示中のペインについては、その時点の実際の幅（スプリッタでドラッグ調整された
+            // 最新の値）を保存する。非表示のペインについては、直前に表示していた時の幅を使う。
+            double folderWidthToSave = (m_folderPaneVisibleFlg && m_folderColumnDef.Width.Value > 0)
+                ? m_folderColumnDef.Width.Value : m_lastFolderColumnWidth;
+            double outlineWidthToSave = (m_outlinePaneVisibleFlg && m_outlineColumnDef.Width.Value > 0)
+                ? m_outlineColumnDef.Width.Value : m_lastOutlineColumnWidth;
+
+            var settings = new AppSettings
+            {
+                IsMaximized = maximizedFlg,
+                WindowWidth = bounds.Width > 0 ? bounds.Width : m_savedSettings.WindowWidth,
+                WindowHeight = bounds.Height > 0 ? bounds.Height : m_savedSettings.WindowHeight,
+                WindowLeft = bounds.X,
+                WindowTop = bounds.Y,
+                FolderPaneVisible = m_folderPaneVisibleFlg,
+                OutlinePaneVisible = m_outlinePaneVisibleFlg,
+                StatusBarVisible = m_statusBarVisibleFlg,
+                FolderPaneWidth = folderWidthToSave,
+                OutlinePaneWidth = outlineWidthToSave,
+                ZoomLevel = m_zoomManager.ZoomLevel,
+                RequireCtrlForLinkClickFlg = m_requireCtrlForLinkClickFlg,
+                PreserveSourceLineBreaksFlg = m_preserveSourceLineBreaksFlg,
+                CorrectColumnWidthsFlg = m_correctColumnWidthsFlg,
+                UniformMarkerStyleFlg = m_uniformMarkerStyleFlg,
+                UseLegacyFontFlg = m_useLegacyFontFlg,
+                SoftTextColorFlg = m_softTextColorFlg,
+                UseVsCodeStyleFlg = m_vsCodeStyleFlg,
+                LimitDocWidthFlg = m_limitDocWidthFlg,
+                DebugLogEnabledFlg = DebugLogger.IsEnabled,
+                PdfMarginTop = m_pdfMarginTop,
+                PdfMarginBottom = m_pdfMarginBottom,
+                PdfMarginLeft = m_pdfMarginLeft,
+                PdfMarginRight = m_pdfMarginRight,
+                RecentFiles = m_recentFiles,
+                RecentFolders = m_recentFolders,
+                LastSaveDialogDirectory = m_lastSaveDialogDirectory
+            };
+            settings.Save();
+        }
+
+        // ======================================================================
+        //  各クラスへ渡す共通delegateの実装
+        // ======================================================================
+
+        /// <summary>渡された処理を「プログラムによる変更」として実行する。実行中は
+        /// Editor_TextChangedの自動変換ロジック（*や#での自動変換など）が働かない。
+        /// 処理全体を Undo 履歴の1操作にまとめ、見出し・太字・リンク等の意味情報（Tag）も Undo／Redo で戻るようにする
+        /// （SemanticUndoTracker.Run。まとめないと、1回の Ctrl+Z で書式だけが戻り、Tag の残った「見た目は普通の文字なのに
+        /// 保存すると太字になる」文字ができていた）。TextChanged は処理の最後（EndChange）にまとめて起きるため、
+        /// フラグは EndChange の後で戻す。入れ子で呼ばれた場合は、外側の状態に戻す。</summary>
+        /// <param name="a_action">実行する処理。</param>
+        private void RunAsProgrammaticChange(Action a_action)
+        {
+            bool previousFlg = m_isProgrammaticChangeFlg;
+            m_isProgrammaticChangeFlg = true;
+            try { m_semanticUndoTracker.Run(a_action); }
+            finally { m_isProgrammaticChangeFlg = previousFlg; }
+        }
+
+        /// <summary>渡された処理を「ハイライトの適用/解除のみ」として実行する。実行中は
+        /// Editor_TextChangedがダーティ扱い・アウトライン再構築・元テキスト保持の破棄を
+        /// 行わないようにする（検索結果の背景色変更は実際の編集ではないため）。</summary>
+        /// <param name="a_action">実行する処理。</param>
+        private void RunWithoutDirtyMarking(Action a_action)
+        {
+            m_isApplyingHighlightFlg = true;
+            try { a_action(); }
+            finally { m_isApplyingHighlightFlg = false; }
+        }
+
+        /// <summary>現在のファイルに未保存の変更があることを記録し、フォルダツリーの表示も
+        /// 更新する。</summary>
+        private void MarkDirty()
+        {
+            m_currentFileIsDirtyFlg = true;
+            m_folderTreeManager.RefreshDirtyMarkers();
+        }
+
+        /// <summary>
+        /// タスクリストのチェックボックス（[ ]/[x]）が変更された段落を「編集済み」として記録し
+        /// （元テキストのままではチェック状態の変化が保存に反映されないため）、ファイルを
+        /// 未保存扱いにする。CheckBox（FrameworkElementの階層）→ InlineUIContainer
+        /// （TextElementの階層）→ Paragraph、と異なるクラス階層をまたいで親をたどる必要がある
+        /// （WPFの制約）。
+        /// </summary>
+        /// <param name="a_checkBoxOrDescendant">トグルされたCheckBox（またはその子孫の要素）。</param>
+        private void InvalidateTaskCheckboxBlock(DependencyObject a_checkBoxOrDescendant)
+        {
+            DependencyObject node = a_checkBoxOrDescendant;
+            while (null != node && !(node is Paragraph))
+            {
+                node = (node is FrameworkElement fe) ? fe.Parent : (node as TextElement)?.Parent;
+            }
+            if (node is Paragraph para)
+            {
+                m_originalTextTracker.InvalidateForBlock(para);
+                MarkDirty();
+            }
+        }
+
+        /// <summary>段落が、表の見出しの行以外のセルの最初の段落か（セルの先頭の"[ ] "/"[x] "をチェックボックスに
+        /// 変換する対象。MarkdownConverter.BuildTableCellFromMarkdownと同じく、見出しの行（表の最初の行）は除く）。</summary>
+        /// <param name="a_para">調べる段落。</param>
+        /// <returns>見出しの行以外のセルの最初の段落ならtrue。</returns>
+        private static bool IsTableBodyCellFirstParagraph(Paragraph a_para)
+        {
+            if (!(a_para.Parent is TableCell cell) || !ReferenceEquals(cell.Blocks.FirstBlock, a_para) ||
+                !(cell.Parent is TableRow row) || !(row.Parent is TableRowGroup rowGroup) || !(rowGroup.Parent is Table table))
+            {
+                return false;
+            }
+            bool headerRowFlg = ReferenceEquals(table.RowGroups.FirstOrDefault(), rowGroup) &&
+                ReferenceEquals(rowGroup.Rows.FirstOrDefault(), row);
+            return !headerRowFlg;
+        }
+
+        /// <summary>
+        /// タスクリストのチェックボックス（[ ]/[x]）がクリックされてチェック状態が変わった時の
+        /// 処理。埋め込まれた各CheckBoxに個別のハンドラを付けるのではなく、ToggleButton.
+        /// CheckedEvent/UncheckedEventがルーティングイベントとしてm_editorまでバブリング
+        /// してくることを利用し、コンストラクタでm_editor自身に登録した単一のハンドラで
+        /// まとめて受け取る。
+        /// 実際の「元テキスト保持」の記憶破棄（InvalidateTaskCheckboxBlock）は、クリックを
+        /// 検出する`EditorPreviewMouseLeftButtonDown`側で既に同期的に呼んでいるため、この
+        /// ハンドラは保険（キーボード操作など、将来他の経路でIsCheckedが変わった場合の
+        /// 受け皿）として残してある。
+        /// </summary>
+        /// <param name="a_sender">イベントの発生元（トグルされたCheckBox）。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void TaskCheckboxToggled(object a_sender, RoutedEventArgs a_args)
+        {
+            if (m_isProgrammaticChangeFlg)
+            {
+                return;
+            }
+            if (!(a_sender is CheckBox cb) || "task-checkbox" != (cb.Tag as string))
+            {
+                return;
+            }
+            InvalidateTaskCheckboxBlock(cb);
+        }
+
+        /// <summary>2つのパスが同一ファイルを指しているかどうかを調べる（大文字小文字を
+        /// 区別せず、完全パスで比較する）。</summary>
+        /// <param name="a_a">比較対象の1つ目。</param>
+        /// <param name="a_b">比較対象の2つ目。</param>
+        /// <returns>同一ファイルを指していればtrue。</returns>
+        private bool PathsReferToSameFile(string a_a, string a_b)
+        {
+            try
+            {
+                return string.Equals(Path.GetFullPath(a_a), Path.GetFullPath(a_b), StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>コードブロックへの貼り付け時に使う、改行を保ったプレーンテキスト挿入。
+        /// TableEditorの貼り付け処理から呼ばれる。かつては行内改行（LineBreak要素）で行を
+        /// つないでいたが、引用・箇条書き項目・表のセルと同じIME不具合の対策として、行ごとに
+        /// 段落を分割する方式（HeadingCodeBlockEditor.SplitCodeBlockParagraphAtCaret）に作り
+        /// 直した。Enterキー1回分のInsertCodeBlockContinuationParagraphと異なり、貼り付けの
+        /// 行数ぶん連続してSplitCodeBlockParagraphAtCaretを呼ぶため、UpdateLayout・
+        /// ClearFocus/Focusの前後処理は1回のRunAsProgrammaticChangeの外側（貼り付け全体）で
+        /// まとめて行う（行ごとに行うと、行数が多い貼り付けで重く・ちらつく原因になるため、
+        /// 元のLineBreak版と同じく「1回のプログラム的変更としてまとめて行う」方針を踏襲する）。</summary>
+        /// <param name="a_text">対象の文字列。</param>
+        private void InsertPlainTextWithLineBreaksForCodeBlock(string a_text)
+        {
+            m_originalTextTracker.Invalidate(m_editor.CaretPosition);
+            var lines = a_text.Replace("\r\n", "\n").Split('\n');
+            RunAsProgrammaticChange(() =>
+            {
+                m_editor.Selection.Text = lines[0];
+                m_editor.CaretPosition = m_editor.Selection.End;
+                for (int i = 1; i < lines.Length; i++)
+                {
+                    var currentPara = m_editor.CaretPosition.Paragraph;
+                    m_headingCodeBlockEditor.SplitCodeBlockParagraphAtCaret(currentPara);
+                    m_editor.Selection.Select(m_editor.CaretPosition, m_editor.CaretPosition);
+                    m_editor.Selection.Text = lines[i];
+                    m_editor.CaretPosition = m_editor.Selection.End;
+                }
+            });
+            m_editor.UpdateLayout();
+            Keyboard.ClearFocus();
+            m_editor.Focus();
+        }
+
+        /// <summary>
+        /// フォルダペインに表示されていない範囲のファイルへのリンクをクリックした際、現在の
+        /// ウィンドウの文書を置き換えるのではなく、新しいウィンドウでそのファイルを開く。
+        /// </summary>
+        /// <param name="a_path">開くファイルの絶対パス。</param>
+        /// <param name="a_anchor">開いたあとにジャンプする見出し/アンカーのテキスト（無ければnull）。</param>
+        private void OpenFileInNewWindow(string a_path, string a_anchor)
+        {
+            var newWindow = new MainWindow(this);
+            newWindow.Show();
+            newWindow.LoadFile(a_path);
+            if (!string.IsNullOrEmpty(a_anchor))
+            {
+                newWindow.m_inlineStyleEditor.JumpToAnchor(a_anchor);
+            }
+        }
+
+        /// <summary>
+        /// ファイルの「今の内容」を解決する：現在開いているファイルならライブなエディタ内容、
+        /// 保留中の編集があればそれ、どちらでもなければ null（呼び出し側がディスクから
+        /// 読み込む）。
+        /// </summary>
+        /// <param name="a_path">対象のファイルパス。</param>
+        /// <returns>そのファイルの現在の内容。該当がなければnull。</returns>
+        private string GetCurrentContentForFile(string a_path)
+        {
+            if (!string.IsNullOrEmpty(m_currentFilePath) && PathsReferToSameFile(a_path, m_currentFilePath))
+            {
+                return m_isSourceModeFlg ? m_sourceEditor.Text : m_markdownConverter.DocumentToMarkdown(m_editor.Document);
+            }
+
+            foreach (var kv in m_pendingFileEdits)
+            {
+                if (PathsReferToSameFile(kv.Key, a_path))
+                {
+                    return kv.Value;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>検索・置換の結果をファイルへ反映する：現在開いているファイルならライブな
+        /// エディタへ直接、そうでなければ保留中の編集として記憶する。</summary>
+        /// <param name="a_path">対象のファイルパス。</param>
+        /// <param name="a_newContent">新しい内容。</param>
+        private void SetFileContentForReplaceImpl(string a_path, string a_newContent)
+        {
+            if (!string.IsNullOrEmpty(m_currentFilePath) && PathsReferToSameFile(a_path, m_currentFilePath))
+            {
+                if (m_isSourceModeFlg)
+                {
+                    m_sourceEditor.Text = a_newContent;
+                }
+                else
+                {
+                    RunAsProgrammaticChange(() => m_markdownConverter.MarkdownToDocument(a_newContent, m_editor.Document));
+                    m_outlineManager.Refresh();
+                }
+            }
+            else
+            {
+                m_pendingFileEdits[a_path] = a_newContent;
+                m_folderTreeManager.RefreshDirtyMarkers();
+            }
+        }
+
+        // ======================================================================
+        //  入力中の自動変換の起点（EditorTextChanged）
+        // ======================================================================
+
+        /// <summary>
+        /// Markdownモードのメイン変更ハンドラ：ファイルをダーティにし、アウトラインを再構築し、
+        /// 触れたブロックの「元テキスト保持」の記憶を破棄する。実際のユーザー入力によるものだけ
+        /// （プログラムによる変更でなければ）、インライン装飾・箇条書き/見出しへの自動変換の
+        /// トリガーもチェックする。
+        /// </summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void EditorTextChanged(object a_sender, TextChangedEventArgs a_args)
+        {
+            // Undo 履歴の深さを数え、見出し・太字等の意味情報（Tag）を Undo／Redo に合わせて戻す。入力中の自動変換（この中で
+            // さらに文書が変わる）より先に呼ぶ必要があるため、一番最初に呼ぶ（SemanticUndoTracker.NotifyTextChanged）
+            m_semanticUndoTracker?.NotifyTextChanged(a_args);
+            // IME固まり調査用：各変更が追加/削除どちらか（挿入/削除文字数）も記録する。
+            // ユーザーの明示的なキー入力ログと対応する変更が見当たらない場合、IME側や
+            // Undoスタックなどアプリの外側から文書が書き換えられたことを疑う手がかりになる。
+            // メッセージ文字列の組み立て（特にLINQでのChanges展開）はC#の仕様上、
+            // DebugLogger.IsEnabledがfalseでも評価されてしまうため、文字入力のたびに呼ばれる
+            // この関数では明示的にIsEnabledで囲み、無効時は組み立てごと省略する。
+            if (DebugLogger.IsEnabled)
+            {
+                string changesDetail = string.Join(",",
+                    a_args.Changes.Select(c => $"[Off={c.Offset} Add={c.AddedLength} Rem={c.RemovedLength}]"));
+                DebugLogger.Log(
+                    $"EditorTextChanged: m_isProgrammaticChangeFlg={m_isProgrammaticChangeFlg} " +
+                    $"IsFocused={m_editor.IsFocused} Changes={a_args.Changes.Count} {changesDetail} " +
+                    $"CanUndo={m_editor.CanUndo} CanRedo={m_editor.CanRedo}");
+            }
+            // RichTextBoxはInitializeComponent中に、既定の空文書を設定する際にTextChangedを
+            // 発生させることがある。その時点ではコンストラクタでの各クラスの構築がまだ
+            // 完了していない可能性があるため、念のためガードしておく。
+            if (null == m_outlineManager ||
+                null == m_folderTreeManager ||
+                null == m_originalTextTracker) return;
+
+            if (m_isSourceModeFlg)
+            {
+                return;
+            }
+
+            // 検索結果のハイライト（背景色）の適用/解除も、WPFの仕様上TextChangedを発生させて
+            // しまうが、これは実際の編集ではないため、ダーティ扱いにしたり元テキスト保持の
+            // 記憶を破棄したりしてはいけない。
+            if (m_isApplyingHighlightFlg)
+            {
+                return;
+            }
+
+            ScheduleOutlineRefresh();
+
+            m_currentFileIsDirtyFlg = true;
+            m_folderTreeManager.RefreshDirtyMarkers();
+            m_originalTextTracker.Invalidate(m_editor.CaretPosition);
+
+            if (m_isProgrammaticChangeFlg)
+            {
+                return;
+            }
+
+            var para = m_editor.CaretPosition?.Paragraph;
+            if (null == para)
+            {
+                return;
+            }
+            if (para.Tag is CodeBlockInfo || para.Tag is CodeBlockContinuationInfo)
+            {
+                return; // コードブロック内は自動整形しない
+            }
+
+            if (m_inlineStyleEditor.CheckInlineFormatTrigger())
+            {
+                return;
+            }
+
+            // タスクチェックボックスを含む段落は、チェックボックスの後ろに実際のInline
+            // （空でよいのでRunが1つ）が常に存在することを前提にしている（段落の中身が
+            // チェックボックスだけだと行の高さの基準がチェックボックス自身になり、箇条書きの
+            // 「・」より位置がずれて見えるため。詳細はBlockStyles.CreateTaskCheckbox参照）。
+            // BackSpace/Deleteで文字を全て消すと、WPF標準の削除処理が空になったRunを内部的に
+            // 取り除くことがあるため、ここで直後のInlineの有無を毎回確認し、無ければ補う。
+            if ((para.Parent is ListItem || para.Parent is TableCell) &&
+                para.Inlines.FirstInline is InlineUIContainer existingTaskIuc &&
+                existingTaskIuc.Child is CheckBox existingTaskCb &&
+                "task-checkbox" == (existingTaskCb.Tag as string) &&
+                null == existingTaskIuc.NextInline)
+            {
+                RunAsProgrammaticChange(() =>
+                {
+                    para.Inlines.Add(new Run(""));
+                });
+            }
+
+            // タスクリスト（"[ ] "/"[x] "）のライブ入力変換。タスクチェックボックスへの変換は、
+            // リスト項目自身の段落（トップレベルではない）に対して行う必要があるため、直後の
+            // トップレベル限定ガードより前でチェックする。見出し・箇条書き・順序付きリストの
+            // 記号変換と同様、行の先頭に既に文字列がある状態で後から"[ ] "/"[x] "を書き足した
+            // 場合にも変換できるよう、末尾（$）ではなく先頭一致のみで判定する。
+            if (para.Parent is ListItem && null == para.Tag)
+            {
+                // TextRange(para.ContentStart, para.ContentEnd).Textは、リスト項目内では行頭の
+                // マーカー記号（「•」等）まで文字列に含んでしまうことがある
+                // （InlineStyleEditor.GetSafeRangeTextの説明を参照）ため、マーカー記号を
+                // 拾わない安全な取得方法を使う。
+                string liText = m_listEditor.GetParagraphPlainText(para);
+                var taskMatch = Regex.Match(liText, "^\\[([ xX])\\][ \u00A0]");
+                if (taskMatch.Success)
+                {
+                    m_listEditor.ConvertListItemTextToTaskCheckbox(
+                        para, " " != taskMatch.Groups[1].Value, taskMatch.Value.Length);
+                    return;
+                }
+            }
+
+            // 表のセル（見出しの行以外）の先頭の"[ ] "/"[x] "も、チェックボックスに変換する（箇条書きと同じ。
+            // 既にチェックボックスがあるセルは除く）。表のセルでは、後ろにスペースを打たなくても、セルの中身が
+            // "[ ]"/"[x]"だけになった時にも変換する（セルの先頭の"[ ]"/"[x]"は、後ろが空白でもセルの終わりでも、
+            // 読み込むとチェックボックスになるため。MarkdownConverter.BuildTableCellFromMarkdown）
+            if (IsTableBodyCellFirstParagraph(para) &&
+                !(para.Inlines.FirstInline is InlineUIContainer firstIuc && firstIuc.Child is CheckBox))
+            {
+                string cellText = m_listEditor.GetParagraphPlainText(para);
+                var cellTaskMatch = Regex.Match(cellText, "^\\[([ xX])\\](?:[ \u00A0]|$)");
+                if (cellTaskMatch.Success)
+                {
+                    m_listEditor.ConvertListItemTextToTaskCheckbox(
+                        para, " " != cellTaskMatch.Groups[1].Value, cellTaskMatch.Value.Length);
+                    return;
+                }
+            }
+
+            if (!(para.Parent is FlowDocument))
+            {
+                return; // 箇条書き/見出しへの自動変換はトップレベル段落のみ
+            }
+
+            string text = new TextRange(para.ContentStart, para.ContentEnd).Text;
+            text = text.TrimEnd('\r', '\n');
+
+            // 行の先頭に既に文字列がある状態で後から記号（*/-/1.等）を書き足した
+            // 場合にも変換できるよう、末尾（$）ではなく先頭一致のみで判定する。
+            // マーカー部分の文字数（bulletMatch.Value.Length等）は、記号の後ろに
+            // 続く既存の内容には触れず、記号部分だけを取り除くために使う。
+            var bulletMatch = Regex.Match(text, "^([*+-])[ \u00A0]");
+            if (bulletMatch.Success)
+            {
+                m_listEditor.ConvertParagraphToListItem(para, bulletMatch.Groups[1].Value, false, bulletMatch.Value.Length);
+                return;
+            }
+            var orderedMatch = Regex.Match(text, "^\\d+\\.[ \u00A0]");
+            if (orderedMatch.Success)
+            {
+                m_listEditor.ConvertParagraphToListItem(para, null, true, orderedMatch.Value.Length);
+                return;
+            }
+            // 行の先頭に既に文字列がある状態で後から"#"を書き足した場合にも変換できるよう、
+            // 末尾（$）ではなく先頭一致のみで判定する。
+            var m = Regex.Match(text, "^(#{1,6})[ \u00A0]");
+            if (m.Success)
+            {
+                m_headingCodeBlockEditor.ConvertParagraphToHeading(para, m.Groups[1].Value.Length);
+                return;
+            }
+            // 引用（"> "）のライブ入力変換。見出しと同じ理由で、末尾（$）ではなく先頭一致のみで
+            // 判定する（行の先頭に既に文字列がある状態で後から"> "を書き足した場合にも対応）。
+            var quoteMatch = Regex.Match(text, "^>[ \u00A0]");
+            if (quoteMatch.Success)
+            {
+                m_headingCodeBlockEditor.ConvertParagraphToQuote(para, quoteMatch.Value.Length);
+                return;
+            }
+            // 水平線（---/***/___）のライブ入力変換。バッチ変換（MarkdownConverter）と同じ
+            // 正規表現を使い、両者の判定基準を一致させている。見出しと異なりトリガーとなる
+            // 区切り文字（スペース等）が存在しないため、段落のテキストがパターンに完全一致
+            // した時点（マーカーが3文字揃った時点）で直ちに変換する。
+            var hrMatch = Regex.Match(text, "^ {0,3}([-*_])\\1{2,}\\s*$");
+            if (hrMatch.Success)
+            {
+                m_headingCodeBlockEditor.ConvertParagraphToHorizontalRule(para);
+            }
+        }
+
+        /// <summary>
+        /// アウトラインペインの再構築（m_outlineManager.Refresh()）を、EditorTextChangedから
+        /// 直接同期実行するのではなく、デバウンスして呼び出す。Refresh()は文書全体を走査して
+        /// 一覧を丸ごと作り直す処理のため、文字入力のたびに毎回同期実行すると重くなる。
+        /// m_outlineRefreshDebounceTimerを呼ばれるたびStop()→Start()し直すことで、最後の編集
+        /// からInterval分だけ操作が無ければ1回だけ実行する、本来の意味でのデバウンスにしている
+        /// （Dispatcher.BeginInvokeによる同一UIサイクル内の間引きでは、連続入力中もほぼ毎回
+        /// Refresh()が走ってしまうため不十分だった）。
+        /// </summary>
+        private void ScheduleOutlineRefresh()
+        {
+            m_outlineRefreshDebounceTimer.Stop();
+            m_outlineRefreshDebounceTimer.Start();
+        }
+
+        // ======================================================================
+        //  キー入力の振り分け（Tab / Enter / 表内の矢印キー）
+        // ======================================================================
+
+        /// <summary>
+        /// 箇条書き/順序付きリストへの変換の入口（スペースキー）。印字可能な文字（スペースを含む）は
+        /// WPFではPreviewKeyDownではなくPreviewTextInputを通じて挿入されるため、PreviewKeyDownで
+        /// a_args.Handled=trueを設定するだけでは確実に文字の挿入を防げない。このイベントで直接
+        /// 判定・処理することで、変換後に元のスペース文字が余分に残ってしまう不具合を防ぐ。
+        /// </summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void EditorPreviewTextInput(object a_sender, TextCompositionEventArgs a_args)
+        {
+            if (m_isSourceModeFlg || " " != a_args.Text)
+            {
+                return;
+            }
+
+            var para = m_editor.CaretPosition?.Paragraph;
+            if (null == para || !(para.Parent is FlowDocument) ||
+                para.Tag is CodeBlockInfo || para.Tag is CodeBlockContinuationInfo)
+            {
+                return;
+            }
+            if (0 != m_editor.CaretPosition.CompareTo(para.ContentEnd))
+            {
+                return;
+            }
+
+            string beforeSpace = new TextRange(para.ContentStart, para.ContentEnd).Text.TrimEnd('\r', '\n');
+
+            // この時点ではスペース文字自体はまだ段落に挿入されていない（a_args.Handled=trueで
+            // 挿入を止めるため）ので、取り除く文字数は記号部分（bulletKeyMatch.Value.Length等）
+            // のみでよい。
+            var bulletKeyMatch = Regex.Match(beforeSpace, "^([*+-])$");
+            if (bulletKeyMatch.Success)
+            {
+                a_args.Handled = true;
+                m_listEditor.ConvertParagraphToListItem(para, bulletKeyMatch.Groups[1].Value, false, bulletKeyMatch.Value.Length);
+                return;
+            }
+            var orderedKeyMatch = Regex.Match(beforeSpace, "^\\d+\\.$");
+            if (orderedKeyMatch.Success)
+            {
+                a_args.Handled = true;
+                m_listEditor.ConvertParagraphToListItem(para, null, true, orderedKeyMatch.Value.Length);
+            }
+        }
+
+        /// <summary>
+        /// 段落が「表の近く」にあるかどうかを、安価に判定する（ResolveParagraphの総当たりを
+        /// 省略してよいかの判断用）。段落を含む最上位のBlock（FlowDocument直下）が、表自身・
+        /// 表の直前のBlock・表の直後のBlockのいずれかであればtrue。表のセル内の段落は
+        /// 最上位のBlockが表になるのでtrueになる。構造が想定外で最上位のBlockが見つからない
+        /// 場合も、安全側（総当たりする側）としてtrueを返す。
+        /// </summary>
+        /// <param name="a_para">判定する段落。</param>
+        /// <returns>表の近く（または判定不能）ならtrue。</returns>
+        private static bool IsParagraphNearTable(Paragraph a_para)
+        {
+            DependencyObject node = a_para;
+            while (node is TextElement element)
+            {
+                if (element is Block block && block.Parent is FlowDocument)
+                {
+                    return block is Table ||
+                           block.PreviousBlock is Table ||
+                           block.NextBlock is Table;
+                }
+                node = element.Parent;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 文書内の表を調べ、指定位置を含むセルの段落を返す（TextPointer.CompareToによる範囲比較。
+        /// 位置の論理方向に依存しない）。まず表全体の範囲で絞り込み、位置を含む表の中だけ
+        /// セルを調べる。見つからなければnull。
+        /// </summary>
+        /// <param name="a_position">解決したい位置。</param>
+        /// <param name="a_document">位置の属する文書。</param>
+        /// <returns>位置を含むセルの段落。なければnull。</returns>
+        private static Paragraph FindTableCellParagraphAt(TextPointer a_position, FlowDocument a_document)
+        {
+            foreach (Table table in a_document.Blocks.OfType<Table>())
+            {
+                if (0 > a_position.CompareTo(table.ContentStart) ||
+                    0 < a_position.CompareTo(table.ContentEnd))
+                {
+                    continue;
+                }
+                foreach (TableRowGroup group in table.RowGroups)
+                {
+                    foreach (TableRow row in group.Rows)
+                    {
+                        foreach (TableCell cell in row.Cells)
+                        {
+                            foreach (Block block in cell.Blocks)
+                            {
+                                if (block is Paragraph cellPara &&
+                                    0 <= a_position.CompareTo(cellPara.ContentStart) &&
+                                    0 >= a_position.CompareTo(cellPara.ContentEnd))
+                                {
+                                    return cellPara;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 表のセル内の段落を優先して探す（`a_document`が渡されている場合）: 文書内の全ての
+        /// 表を直接辿り、各セルの段落の範囲（`ContentStart`〜`ContentEnd`）に`a_position`が
+        /// 含まれるかを`TextPointer.CompareTo`（2つの位置の前後関係を調べるだけの、曖昧さの
+        /// ない比較）で判定する。表のセル内かどうかをこの方法で最初に確定させ、それ以外の
+        /// 場合にのみ`TextPointer.Paragraph`・`.Parent`によるフォールバックへ進む。
+        ///
+        /// 当初は逆に、`.Paragraph`を一次手段として使い、`null`が返った場合にのみ`.Parent`を
+        /// 上へ辿るフォールバックを行い、それでも解決できない場合の最後の手段として上記の
+        /// 表の総当たりを行っていた。しかし、表の最後の行の最後のセルの末尾でEnterキーを
+        /// 押すと表が壊れる不具合の調査（14.71〜14.73節）を重ねる中で、この前提そのものが
+        /// 誤りだったと判明した。この境界位置（キャレットの直前でParagraph・TableCell・
+        /// TableRow・TableRowGroup・Tableという複数の要素の終端が1点に重なる位置）で、かつ
+        /// 表のすぐ後ろに（多くの場合`TableEditor.InsertTable`が自動的に挿入する）空の
+        /// 段落が続いている場合、`.Paragraph`は`null`を返すのではなく、その後ろの段落
+        /// （表の外の、次の段落）を返してしまうことがある。原因は、セルの最後の位置まで
+        /// キャレットを移動する操作（右矢印キー等）によってキャレットの論理方向が前方
+        /// （Forward）になり、`.Paragraph`が前方方向を優先してこの曖昧な境界位置を解決する
+        /// ためと考えられる。この場合`.Paragraph`は`null`を返さない（＝非nullの値を返して
+        /// しまう）ため、それ以降のnullチェック前提のフォールバック（`.Parent`を辿る処理や
+        /// 後方方向への取り直し）は一切実行されず、そのまま（表の外の）誤った段落が返って
+        /// しまっていた。これが、境界位置の検出だけをいくら精緻化しても（14.71・14.72節）
+        /// 直らなかった理由である。呼び出し元の`EditorPreviewKeyDown`では、この誤った段落の
+        /// 親（`FlowDocument`）を見てもEnterキーを処理すべき条件に一致せず、結局どの分岐にも
+        /// 入らないままWPF標準（RichTextBoxの表編集機能）の既定のEnter処理に委ねられ、表の
+        /// 行・罫線が壊れる不具合につながっていた（この時、内部的には表の最後に新しい行が
+        /// 正しく追加されており、ソースモードへの切り替え・Markdownモードへの切り替えで
+        /// 文書を再構築すると見た目も正しく直ることが、今回のご報告で確認された）。
+        ///
+        /// 表のセル内かどうかを`.Paragraph`より先に、位置の論理方向に依存しない方法
+        /// （`CompareTo`による範囲比較）で確定させることで、この曖昧な解決に一切左右されず
+        /// 確実にセルの段落を特定できる。ただしこの関数はEditorPreviewKeyDownから全てのキー
+        /// 入力のたびに呼ばれるため、総当たりは表の近く（セル内・表の直前直後・
+        /// `.Paragraph`がnull）にいる時だけに限定している（IsParagraphNearTable参照。
+        /// 以前は常に総当たりしており、表の多い文書で入力・範囲選択が重くなっていた）。
+        /// </summary>
+        /// <param name="a_position">解決したい位置。</param>
+        /// <param name="a_document">
+        /// 表のセル内の段落を優先して探す処理で使う、位置の属する文書。nullの場合はその
+        /// 処理を行わず、`TextPointer.Paragraph`・`.Parent`によるフォールバックのみを使う。
+        /// </param>
+        /// <returns>囲んでいるParagraph（見つからなければnull）。</returns>
+        private static Paragraph ResolveParagraph(TextPointer a_position, FlowDocument a_document = null)
+        {
+            if (null == a_position)
+            {
+                return null;
+            }
+
+            // 【キー入力のたびに全表の全セルを調べてしまい、表の多い文書で入力・範囲選択が
+            // 重くなる不具合の修正】この関数はEditorPreviewKeyDownから「全てのキー入力」の
+            // たびに呼ばれる（Enterキー押下時に限らない）。以前は、ここで毎回、文書内の全ての
+            // 表の全てのセルの段落をTextPointer.CompareToで総当たりしていたため、表やセルの
+            // 数に比例して1キーあたりの処理が増え、READMEのように表の多い文書を入力していくと
+            // 次第にレスポンスが悪化していた。総当たりが本当に必要なのは、WPF標準の
+            // 「.Paragraph」が誤った（またはnullの）結果を返しうる、表の境界付近の位置だけ
+            // （上のコメント参照）。そこで、まず「.Paragraph」の結果が表と無関係であること
+            // （表のセルの中でもなく、表の直前・直後のBlockでもない）を安価に確認し、無関係なら
+            // 総当たりを省略する。表の近くにいる場合、または「.Paragraph」がnullの場合だけ、
+            // 従来どおりの総当たり（FindTableCellParagraphAt）で確実に判定する。
+            if (null != a_document)
+            {
+                Paragraph hintPara = a_position.Paragraph;
+                if (null == hintPara || IsParagraphNearTable(hintPara))
+                {
+                    Paragraph cellParaAtPosition = FindTableCellParagraphAt(a_position, a_document);
+                    if (null != cellParaAtPosition)
+                    {
+                        return cellParaAtPosition;
+                    }
+                }
+            }
+
+            if (a_position.Paragraph is Paragraph direct)
+            {
+                return direct;
+            }
+            DependencyObject node = a_position.Parent;
+            while (null != node)
+            {
+                if (node is Paragraph p)
+                {
+                    return p;
+                }
+                node = (node as TextElement)?.Parent;
+            }
+
+            TextPointer backward = a_position.GetPositionAtOffset(0, LogicalDirection.Backward);
+            if (backward?.Paragraph is Paragraph backwardDirect)
+            {
+                return backwardDirect;
+            }
+            DependencyObject backwardNode = backward?.Parent;
+            while (null != backwardNode)
+            {
+                if (backwardNode is Paragraph bp)
+                {
+                    return bp;
+                }
+                backwardNode = (backwardNode as TextElement)?.Parent;
+            }
+
+            // 最後の保険：ここまでの全ての方法（セル範囲への一致、前方・後方どちらの方向でも
+            // の`.Paragraph`・`.Parent`）で見つからなかった場合、文書内にある表のうち、
+            // その表の開始位置（ContentStart）が指定位置以前にある最後の表（文書順で最も
+            // 後ろにある表）があれば、その表の最後のセルの最後の段落を返す。「表が文書の
+            // 最後のBlockである場合」に限定せず常にこの条件で判定するのは、全セルが空の
+            // 表で最後のセルから右矢印キーを押すと、表の直後に空の段落が実際には存在する
+            // にもかかわらず、その位置が前方・後方どちらの`.Paragraph`・`.Parent`でも解決
+            // できない（境界がすべて1点に重なり、キー操作で一気に飛び越えてしまう）事例が
+            // あるため（詳細な発生メカニズムは未特定。次に通った場合に備え、直後に調査用
+            // ログを残す）。ここまでの全ての方法を試した後の最後の手段のため、多少広めの
+            // 条件でも実用上の弊害は小さい。
+            Table fallbackTable = null;
+            if (null != a_document)
+            {
+                foreach (Table table in a_document.Blocks.OfType<Table>())
+                {
+                    if (0 <= a_position.CompareTo(table.ContentStart))
+                    {
+                        fallbackTable = table;
+                    }
+                }
+            }
+            if (null != fallbackTable)
+            {
+                TableRowGroup lastGroup = fallbackTable.RowGroups.LastOrDefault();
+                TableRow lastRow = lastGroup?.Rows.LastOrDefault();
+                TableCell lastCell = lastRow?.Cells.LastOrDefault();
+                if (lastCell?.Blocks.LastOrDefault() is Paragraph lastCellPara)
+                {
+                    return lastCellPara;
+                }
+            }
+
+            // ここまでの全ての方法（表内の保険も含めて）で見つからなかった場合の調査用ログ。
+            // 本来ここに来ることはないはずだが、万一まだ来る場合に備えて、前方・後方双方向の
+            // GetPointerContext・親要素チェーン・文書内最後のBlockの種類を記録しておく。
+            if (DebugLogger.IsEnabled)
+            {
+                string DescribeParentChain(DependencyObject a_start)
+                {
+                    var names = new List<string>();
+                    DependencyObject n = a_start;
+                    int guard = 0;
+                    while (null != n && guard++ < 20)
+                    {
+                        names.Add(n.GetType().Name);
+                        n = (n as TextElement)?.Parent;
+                    }
+                    return names.Count > 0 ? string.Join("→", names) : "(none)";
+                }
+                DebugLogger.Log(
+                    "ResolveParagraph: 解決できずnullを返す直前の状態 " +
+                    $"ForwardContext={a_position.GetPointerContext(LogicalDirection.Forward)} " +
+                    $"BackwardContext={a_position.GetPointerContext(LogicalDirection.Backward)} " +
+                    $"ForwardParentChain={DescribeParentChain(a_position.Parent)} " +
+                    $"BackwardParentChain={DescribeParentChain(backward?.Parent)} " +
+                    $"DocumentLastBlock={a_document?.Blocks.LastBlock?.GetType().Name ?? "null"} " +
+                    $"TableCount={a_document?.Blocks.OfType<Table>().Count().ToString() ?? "N/A"}");
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 他のアプリ（Claude 等のチャット・Web ページ・Word・Google ドキュメント等）でコピーした書式付きの内容（HTML）を、
+        /// Markdown に直してから書式にして貼り付ける（mdew・mdee と同じ。変換は HtmlToMarkdown）。見出し・リスト・表・
+        /// コードブロック・引用・太字・斜体・リンク等が、mde の書式になる（文字の色・大きさ等の飾りは捨てる）。
+        /// 次の場合は何もせず、これまで通り後のハンドラ（TableEditor.HandlePasting・EditorHandleInlineMarkdownPasting）
+        /// や WPF 標準の貼り付けに任せる：
+        ///  - mde どうしのコピー（Xaml 形式が付いている。構造をそのまま復元する WPF 標準の貼り付けに任せる）
+        ///  - 書式の無い HTML（VS Code の色付けだけの HTML 等。文字として貼る）
+        ///  - 表だけの HTML（Excel 等。TableEditor.HandlePasting が表にする）
+        ///  - コードブロックの中（TableEditor.HandlePasting が文字のまま貼る）
+        /// Word は Rtf 形式も付けるが、WPF 標準の Rtf の貼り付けでは mde の書式（Run の Tag）が付かず保存すると書式が
+        /// 消えるため、HTML の方を使う。
+        /// </summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">貼り付けイベントの引数。</param>
+        private void EditorHandleHtmlPasting(object a_sender, DataObjectPastingEventArgs a_args)
+        {
+            if (m_isSourceModeFlg ||
+                a_args.CommandCancelled)
+            {
+                return;
+            }
+            IDataObject data = a_args.SourceDataObject;
+            if (data.GetDataPresent(DataFormats.Xaml) ||
+                !data.GetDataPresent(DataFormats.Html))
+            {
+                return;
+            }
+            // 空の文書（新規作成直後・すべて消した後）は段落が無いため null になる。その場合も貼り付ける（PasteMarkdown が
+            // 段落を作る）
+            var para = ResolveParagraph(m_editor.CaretPosition, m_editor.Document);
+            if ((null == para && 0 < m_editor.Document.Blocks.Count) ||
+                para?.Tag is CodeBlockInfo ||
+                para?.Tag is CodeBlockContinuationInfo)
+            {
+                return;
+            }
+            HtmlToMarkdown.Result converted;
+            string text = null;
+            try
+            {
+                converted = HtmlToMarkdown.Convert(data.GetData(DataFormats.Html) as string);
+                if (data.GetDataPresent(DataFormats.UnicodeText))
+                {
+                    text = data.GetData(DataFormats.UnicodeText) as string;
+                }
+            }
+            catch (Exception ex)
+            {
+                // クリップボードの読み取り・変換に失敗した場合は、これまで通りの貼り付けに任せる
+                DebugLogger.Log($"EditorHandleHtmlPasting: HTML を変換できなかった（{ex.Message}）");
+                return;
+            }
+            if (null == converted ||
+                !converted.RichFlg ||
+                0 == converted.Markdown.Trim().Length)
+            {
+                return;
+            }
+            if (converted.Markdown.Split('\n').All(l => l.StartsWith("|")))
+            {
+                return; // 表だけ：TableEditor.HandlePasting に任せる（Excel 等の表の貼り付けは今まで通り）
+            }
+            a_args.CancelCommand();
+            PasteMarkdown(converted.Markdown, text);
+        }
+
+        /// <summary>
+        /// コピー・切り取り（WPF 標準。Ctrl+C・Ctrl+X）の後に、クリップボードの文字（UnicodeText・Text・OEMText・HTML）から、
+        /// リンクの URL の折り返し用の見えない文字（BlockStyles.URL_BREAK_JOINER）を取り除く。取り除かないと、コピーした URL を
+        /// ブラウザ等に貼った時に、見えない文字の入った別の URL になってしまう。コピーの処理（WPF 標準）が終わった後で
+        /// クリップボードを読み直して書き直す（コピーの途中の DataObject は書き換えられないため）。mde どうしの貼り付けに使う
+        /// Xaml 等の形式はそのまま残す（貼った後のリンクは、保存時に取り除かれる）。
+        /// </summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">コピーのイベントの引数。</param>
+        private void EditorHandleCopying(object a_sender, DataObjectCopyingEventArgs a_args)
+        {
+            if (m_isSourceModeFlg || a_args.IsDragDrop)
+            {
+                return;
+            }
+            // mde どうしで貼り付けた時に見出し・太字・リンク等の書式が保たれるよう、選んだ範囲を Markdown にして
+            // 独自の形式で一緒に載せておく（EditorHandleMdeMarkdownPasting）。WPF 標準のコピー（Xaml 形式）では、
+            // mde の書式の目印（Paragraph・Run の Tag）が写らず、貼った所は見た目だけ見出し・太字のまま、保存すると
+            // ただの文字になっていた。
+            string selectionMarkdown = TryBuildSelectionMarkdown();
+            if (null != selectionMarkdown)
+            {
+                try
+                {
+                    a_args.DataObject.SetData(MDE_MARKDOWN_CLIPBOARD_FORMAT, selectionMarkdown);
+                }
+                catch (Exception ex)
+                {
+                    DebugLogger.Log($"EditorHandleCopying: Markdown を載せられなかった（{ex.Message}）");
+                }
+            }
+            Dispatcher.BeginInvoke(new Action(StripUrlBreakJoinersFromClipboard), System.Windows.Threading.DispatcherPriority.Background);
+        }
+
+        /// <summary>mde どうしのコピー・貼り付けで、選んだ範囲の Markdown を載せるクリップボードの形式名。</summary>
+        private const string MDE_MARKDOWN_CLIPBOARD_FORMAT = "mde.Markdown";
+
+        /// <summary>
+        /// 選んでいる範囲を Markdown にする（EditorHandleCopying）。
+        ///  - 1つの段落の中だけ（表のセル・箇条書きの項目の中を含む）：段落の種類の記号を付けない、書式付きの文字
+        ///    （ただし、本文の段落・見出し等をまるごと選んだ時は、ブロックとして）
+        ///  - 複数のブロック：まるごと入っているブロックはそのまま、途中から・途中までのブロックは複製を切り詰めて
+        ///    Markdown にする
+        /// 画像を含む範囲・表やコードブロックの途中から（まで）の範囲・変換できなかった場合は null を返し、これまで通り
+        /// WPF 標準のコピー・貼り付けに任せる。
+        /// </summary>
+        /// <returns>Markdown。作らない場合は null。</returns>
+        private string TryBuildSelectionMarkdown()
+        {
+            try
+            {
+                TextSelection sel = m_editor.Selection;
+                if (sel.IsEmpty)
+                {
+                    return null;
+                }
+                TextPointer selStart = sel.Start;
+                TextPointer selEnd = sel.End;
+
+                Paragraph startPara = selStart.Paragraph;
+                Paragraph endPara = selEnd.Paragraph;
+                if (null != startPara && ReferenceEquals(startPara, endPara))
+                {
+                    if (startPara.Tag is CodeBlockInfo || startPara.Tag is CodeBlockContinuationInfo || ContainsImage(startPara))
+                    {
+                        return null;
+                    }
+                    bool wholeFlg = !HasTextBetween(startPara.ContentStart, selStart) && !HasTextBetween(selEnd, startPara.ContentEnd);
+                    if (!(wholeFlg && startPara.Parent is FlowDocument))
+                    {
+                        var inlineClone = CloneTrimmedBlock(startPara, selStart, selEnd) as Paragraph;
+                        return null == inlineClone ? null : m_markdownConverter.ParagraphInlinesToMarkdown(inlineClone);
+                    }
+                }
+
+                var picked = new List<Block>();
+                foreach (Block block in m_editor.Document.Blocks)
+                {
+                    if (block.ElementEnd.CompareTo(selStart) <= 0)
+                    {
+                        continue;
+                    }
+                    if (block.ElementStart.CompareTo(selEnd) >= 0)
+                    {
+                        break;
+                    }
+                    picked.Add(block);
+                }
+                if (0 == picked.Count || picked.Any(ContainsImage))
+                {
+                    return null;
+                }
+                if (picked[0] is Paragraph firstPara && firstPara.Tag is CodeBlockContinuationInfo)
+                {
+                    return null; // コードブロックの途中から
+                }
+                if (picked[picked.Count - 1] is Paragraph lastPara &&
+                    (lastPara.Tag is CodeBlockInfo || lastPara.Tag is CodeBlockContinuationInfo) &&
+                    lastPara.NextBlock is Paragraph afterLastPara && afterLastPara.Tag is CodeBlockContinuationInfo)
+                {
+                    return null; // コードブロックの途中まで
+                }
+
+                var blocks = new List<Block>();
+                for (int i = 0; i < picked.Count; i++)
+                {
+                    Block block = picked[i];
+                    bool cutStartFlg = 0 == i && HasTextBetween(block.ContentStart, selStart);
+                    bool cutEndFlg = picked.Count - 1 == i && HasTextBetween(selEnd, block.ContentEnd);
+                    if (!cutStartFlg && !cutEndFlg)
+                    {
+                        blocks.Add(block);
+                        continue;
+                    }
+                    if ((cutEndFlg && !HasTextBetween(block.ContentStart, selEnd)) ||
+                        (cutStartFlg && !HasTextBetween(selStart, block.ContentEnd)))
+                    {
+                        continue; // 選んだ範囲がこのブロックの先頭で終わる（末尾から始まる）：文字を含まないため入れない
+                    }
+                    if (block is Table ||
+                        (block is Paragraph codePara && (codePara.Tag is CodeBlockInfo || codePara.Tag is CodeBlockContinuationInfo)))
+                    {
+                        return null;
+                    }
+                    Block clone = CloneTrimmedBlock(block, cutStartFlg ? selStart : null, cutEndFlg ? selEnd : null);
+                    if (null == clone)
+                    {
+                        return null;
+                    }
+                    blocks.Add(clone);
+                }
+                string md = m_markdownConverter.BlocksToMarkdown(blocks);
+                return string.IsNullOrWhiteSpace(md) ? null : md;
+            }
+            catch (Exception ex)
+            {
+                DebugLogger.Log($"TryBuildSelectionMarkdown: Markdown にできなかった（{ex.Message}）");
+                return null;
+            }
+        }
+
+        /// <summary>2つの位置の間に、文字（ゼロ幅スペース・URL の折り返し用の文字を除く）か埋め込みの要素があるか
+        /// （a_from が a_to 以降なら false）。箇条書きの項目では TextRange.Text が行頭の記号まで拾うため、Run の文字を
+        /// 直接数える。</summary>
+        /// <param name="a_from">始まり。</param>
+        /// <param name="a_to">終わり。</param>
+        /// <returns>あれば true。</returns>
+        private static bool HasTextBetween(TextPointer a_from, TextPointer a_to)
+        {
+            for (TextPointer pos = a_from; null != pos && 0 > pos.CompareTo(a_to); pos = pos.GetNextContextPosition(LogicalDirection.Forward))
+            {
+                TextPointerContext context = pos.GetPointerContext(LogicalDirection.Forward);
+                if (TextPointerContext.EmbeddedElement == context)
+                {
+                    return true;
+                }
+                if (TextPointerContext.Text == context)
+                {
+                    string run = pos.GetTextInRun(LogicalDirection.Forward);
+                    int length = Math.Min(run.Length, pos.GetOffsetToPosition(a_to));
+                    for (int i = 0; i < length; i++)
+                    {
+                        if ('\u200B' != run[i] && BlockStyles.URL_BREAK_JOINER != run[i])
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        /// <summary>画像（または UI 要素のブロック）を含むか。</summary>
+        /// <param name="a_obj">調べる要素。</param>
+        /// <returns>含めば true。</returns>
+        private static bool ContainsImage(DependencyObject a_obj)
+        {
+            if (a_obj is Image || a_obj is BlockUIContainer)
+            {
+                return true;
+            }
+            foreach (object child in LogicalTreeHelper.GetChildren(a_obj))
+            {
+                if (child is DependencyObject childObj && ContainsImage(childObj))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// ブロックを複製し（Tag も含めて。XamlWriter）、a_cutBefore より前・a_cutAfter より後ろの文字を消す。
+        /// 複製の中の位置は、元のブロックの先頭からの距離（シンボルの数）で求め、その位置までの文字が元と同じことを
+        /// 確かめる（違えば null）。
+        /// </summary>
+        /// <param name="a_source">元のブロック。</param>
+        /// <param name="a_cutBefore">これより前を消す位置（null なら消さない）。</param>
+        /// <param name="a_cutAfter">これより後ろを消す位置（null なら消さない）。</param>
+        /// <returns>切り詰めた複製（一時的な FlowDocument の中にある）。できなければ null。</returns>
+        private static Block CloneTrimmedBlock(Block a_source, TextPointer a_cutBefore, TextPointer a_cutAfter)
+        {
+            var clone = (Block)System.Windows.Markup.XamlReader.Parse(System.Windows.Markup.XamlWriter.Save(a_source));
+            var tempDoc = new FlowDocument();
+            tempDoc.Blocks.Add(clone);
+
+            TextPointer MapToClone(TextPointer a_pos)
+            {
+                if (0 > a_pos.CompareTo(a_source.ContentStart) || 0 < a_pos.CompareTo(a_source.ContentEnd))
+                {
+                    return null;
+                }
+                TextPointer mapped = clone.ContentStart.GetPositionAtOffset(a_source.ContentStart.GetOffsetToPosition(a_pos));
+                if (null == mapped ||
+                    new TextRange(a_source.ContentStart, a_pos).Text != new TextRange(clone.ContentStart, mapped).Text)
+                {
+                    return null;
+                }
+                return mapped;
+            }
+
+            // 後ろを先に消す（前を先に消すと、後ろの位置の距離が変わるため）
+            if (null != a_cutAfter)
+            {
+                TextPointer cloneCutAfter = MapToClone(a_cutAfter);
+                if (null == cloneCutAfter)
+                {
+                    return null;
+                }
+                new TextRange(cloneCutAfter, clone.ContentEnd).Text = "";
+            }
+            if (null != a_cutBefore)
+            {
+                TextPointer cloneCutBefore = MapToClone(a_cutBefore);
+                if (null == cloneCutBefore)
+                {
+                    return null;
+                }
+                new TextRange(clone.ContentStart, cloneCutBefore).Text = "";
+            }
+            return clone;
+        }
+
+        /// <summary>
+        /// mde でコピーした内容（EditorHandleCopying が載せた Markdown）を、書式にして貼り付ける（PasteMarkdown）。
+        /// コードブロックの中へ貼る時は何もせず、これまで通り文字のまま貼る（TableEditor.HandlePasting）。
+        /// </summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">貼り付けイベントの引数。</param>
+        private void EditorHandleMdeMarkdownPasting(object a_sender, DataObjectPastingEventArgs a_args)
+        {
+            if (m_isSourceModeFlg || a_args.CommandCancelled || a_args.IsDragDrop)
+            {
+                return;
+            }
+            IDataObject data = a_args.SourceDataObject;
+            if (!data.GetDataPresent(MDE_MARKDOWN_CLIPBOARD_FORMAT))
+            {
+                return;
+            }
+            var para = ResolveParagraph(m_editor.CaretPosition, m_editor.Document);
+            if (para?.Tag is CodeBlockInfo || para?.Tag is CodeBlockContinuationInfo)
+            {
+                return;
+            }
+            string md;
+            string text = null;
+            try
+            {
+                md = data.GetData(MDE_MARKDOWN_CLIPBOARD_FORMAT) as string;
+                if (data.GetDataPresent(DataFormats.UnicodeText))
+                {
+                    text = data.GetData(DataFormats.UnicodeText) as string;
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLogger.Log($"EditorHandleMdeMarkdownPasting: クリップボードを読めなかった（{ex.Message}）");
+                return;
+            }
+            if (string.IsNullOrEmpty(md))
+            {
+                return;
+            }
+            a_args.CancelCommand();
+            PasteMarkdown(md, text);
+        }
+
+        /// <summary>クリップボードの文字から、BlockStyles.URL_BREAK_JOINER を取り除く（EditorHandleCopying）。含まれていなければ
+        /// 何もしない。</summary>
+        private static void StripUrlBreakJoinersFromClipboard()
+        {
+            try
+            {
+                IDataObject source = Clipboard.GetDataObject();
+                string unicodeText = source?.GetData(DataFormats.UnicodeText) as string;
+                if (null == unicodeText || 0 > unicodeText.IndexOf(BlockStyles.URL_BREAK_JOINER))
+                {
+                    return;
+                }
+                var textFormats = new HashSet<string> { DataFormats.UnicodeText, DataFormats.Text, DataFormats.OemText, DataFormats.Html, "System.String" };
+                var result = new DataObject();
+                foreach (string format in source.GetFormats(false))
+                {
+                    object value;
+                    try
+                    {
+                        value = source.GetData(format, false);
+                    }
+                    catch (Exception)
+                    {
+                        continue; // 読めない形式は写さない
+                    }
+                    if (null == value)
+                    {
+                        continue;
+                    }
+                    if (value is string text && textFormats.Contains(format))
+                    {
+                        value = BlockStyles.StripUrlBreakJoiners(text);
+                    }
+                    result.SetData(format, value, false);
+                }
+                Clipboard.SetDataObject(result, true);
+            }
+            catch (Exception ex)
+            {
+                // クリップボードを書き直せなくても、コピー自体はできている
+                DebugLogger.Log($"StripUrlBreakJoinersFromClipboard: クリップボードを書き直せなかった（{ex.Message}）");
+            }
+        }
+
+        /// <summary>
+        /// 他アプリや、Xaml/Rtf形式を伴わない生のテキストが貼り付けられた時、そのテキストを
+        /// Markdownとして解釈しながら挿入する（PasteMarkdown）。1つの段落だけなら、これまで通り
+        /// インライン記法（**太字**・~~取り消し線~~・&lt;u&gt;下線&lt;/u&gt;・`コード`・[リンク](url)等）を
+        /// 書式にして今の段落に挿入する。見出し・リスト・表・コードブロック等を含む場合は、mdew・mdee と同じく
+        /// ブロックとして挿入する。Xaml/Rtfを伴う貼り付け（mdeや他の
+        /// リッチテキストアプリから）はWPF標準の貼り付けにそのまま任せる。`DataObject.
+        /// AddPastingHandler`は登録順に全ハンドラを呼ぶため、画像は`ImageManager.HandlePasting`、
+        /// 書式付きの HTML は `EditorHandleHtmlPasting`、
+        /// コードブロック・表は`TableEditor.HandlePasting`がこのハンドラより先に登録されており、
+        /// それぞれ処理済みなら`CancelCommand()`する。ここでは`a_args.CommandCancelled`を
+        /// 確認してから処理することで、それらと重複処理しないようにしている。
+        /// </summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">貼り付けイベントの引数。</param>
+        private void EditorHandleInlineMarkdownPasting(object a_sender, DataObjectPastingEventArgs a_args)
+        {
+            if (m_isSourceModeFlg ||
+                a_args.CommandCancelled)
+            {
+                return;
+            }
+            if (a_args.SourceDataObject.GetDataPresent(DataFormats.Xaml) ||
+                a_args.SourceDataObject.GetDataPresent(DataFormats.Rtf))
+            {
+                return; // リッチな形式が付いている場合はWPF標準の貼り付けに任せる
+            }
+            var para = ResolveParagraph(m_editor.CaretPosition, m_editor.Document);
+            if (null != para && (para.Tag is CodeBlockInfo || para.Tag is CodeBlockContinuationInfo))
+            {
+                return; // コードブロックへの貼り付けはTableEditor.HandlePastingが処理する
+            }
+            if (!a_args.SourceDataObject.GetDataPresent(DataFormats.Text))
+            {
+                return;
+            }
+            string text = (string)a_args.SourceDataObject.GetData(DataFormats.Text);
+            if (string.IsNullOrEmpty(text))
+            {
+                return;
+            }
+
+            a_args.CancelCommand();
+            PasteMarkdown(text, null);
+        }
+
+        /// <summary>
+        /// Markdown の文字を、書式にしてキャレット位置に貼り付ける（mdew・mdee の pasteMarkdown と同じ考え方）。
+        ///  - 1つの段落だけの場合：これまで通り、今の段落（見出し・項目・表のセル等）の中に、太字・リンク等の書式に
+        ///    して挿入する（MarkdownConverter.InsertInlineMarkdownAtPosition）
+        ///  - 複数のブロック（見出し・リスト・表・コードブロック等）の場合：今の段落をキャレット位置で分けて、その間に
+        ///    ブロックを入れる（TryInsertMarkdownBlocksAtCaret）
+        ///  - 箇条書きの項目の中にリストだけを貼る場合：今の項目の後ろに項目として加える
+        ///  - 表のセル・引用の中等、ブロックを置けない場所：a_fallbackText（無ければ a_markdown）を、これまで通り
+        ///    インライン記法として挿入する
+        /// </summary>
+        /// <param name="a_markdown">貼り付ける Markdown。</param>
+        /// <param name="a_fallbackText">ブロックを置けない場所で、代わりに貼る文字（HTML から変換した Markdown を
+        /// 貼る時の、クリップボードの文字）。null なら a_markdown を使う。</param>
+        private void PasteMarkdown(string a_markdown, string a_fallbackText)
+        {
+            string md = a_markdown.Replace("\r\n", "\n").Replace("\r", "\n");
+            m_originalTextTracker.Invalidate(m_editor.CaretPosition);
+            RunAsProgrammaticChange(() =>
+            {
+                if (!m_editor.Selection.IsEmpty)
+                {
+                    m_editor.Selection.Text = "";
+                }
+                EnsureParagraphInEmptyDocument();
+                MarkdownPasteKind kind = TryInsertMarkdownBlocksAtCaret(md);
+                if (MarkdownPasteKind.Blocks == kind)
+                {
+                    return;
+                }
+                string text = MarkdownPasteKind.Fallback == kind && null != a_fallbackText
+                    ? a_fallbackText.Replace("\r\n", "\n").Replace("\r", "\n")
+                    : md;
+                TextPointer end = m_markdownConverter.InsertInlineMarkdownAtPosition(m_editor.CaretPosition, text);
+                m_editor.CaretPosition = end;
+                m_editor.Selection.Select(end, end);
+            });
+            m_outlineManager.Refresh();
+            MarkDirty();
+        }
+
+        /// <summary>直前にキャレットがあった表（RefreshTableWidthsOnLeave）。表の外なら null。</summary>
+        private Table m_lastCaretTable;
+
+        /// <summary>
+        /// キャレットが表の外へ出た（別の表へ移った）時に、それまでキャレットがあった表の列幅を、今の内容に合わせ直す
+        /// （BlockStyles.RefreshAutoCalculatedColumnWidths。ウィンドウの大きさを変えた時と同じ）。列幅は表を作った時の内容で
+        /// 決まるため、行を足したり文字を書き足したりすると、狭い列で折り返したままになっていた（mdew・mdee は書くたびに
+        /// 合わせ直す）。日本語入力の途中で列幅（表の見た目）が変わらないよう、入力中ではなく、表から出た時に行う。
+        /// </summary>
+        private void RefreshTableWidthsOnLeave()
+        {
+            if (m_isSourceModeFlg)
+            {
+                return;
+            }
+            Table current = null;
+            for (DependencyObject node = m_editor.CaretPosition?.Paragraph; null != node; node = (node as TextElement)?.Parent)
+            {
+                if (node is Table table)
+                {
+                    current = table;
+                    break;
+                }
+            }
+            Table left = m_lastCaretTable;
+            m_lastCaretTable = current;
+            if (null == left || ReferenceEquals(left, current) || !m_correctColumnWidthsFlg)
+            {
+                return;
+            }
+            // 選択の変更の通知の中では文書を変えず、後で行う
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (!m_isSourceModeFlg && ReferenceEquals(left.Parent, m_editor.Document))
+                {
+                    RunWithoutDirtyMarking(() => BlockStyles.RefreshAutoCalculatedColumnWidths(left, m_tableEditor.GetAvailableTableWidth()));
+                }
+            }), System.Windows.Threading.DispatcherPriority.Background);
+        }
+
+        /// <summary>文書が空（段落が1つも無い。すべて消した後等）なら、空の段落を作ってキャレットを置く（貼り付ける場所を
+        /// 作る。PasteMarkdown）。</summary>
+        private void EnsureParagraphInEmptyDocument()
+        {
+            if (0 == m_editor.Document.Blocks.Count)
+            {
+                var para = new Paragraph();
+                m_editor.Document.Blocks.Add(para);
+                m_editor.CaretPosition = para.ContentStart;
+            }
+        }
+
+        /// <summary>TryInsertMarkdownBlocksAtCaret の結果。</summary>
+        private enum MarkdownPasteKind
+        {
+            /// <summary>ブロックとして挿入した。</summary>
+            Blocks,
+            /// <summary>1つの段落だけなので、今の段落の中に書式として挿入する（呼び出し側が行う）。</summary>
+            Inline,
+            /// <summary>この場所にはブロックを置けないので、文字として挿入する（呼び出し側が行う）。</summary>
+            Fallback,
+        }
+
+        /// <summary>段落が空か（文字・画像・チェックボックスが無い。書式の区切りのゼロ幅スペースは文字とみなさない）。</summary>
+        /// <param name="a_para">調べる段落。</param>
+        /// <returns>空なら true。</returns>
+        private static bool IsParagraphEmpty(Paragraph a_para)
+        {
+            if (a_para.Inlines.OfType<InlineUIContainer>().Any())
+            {
+                return false;
+            }
+            string text = new TextRange(a_para.ContentStart, a_para.ContentEnd).Text;
+            return 0 == text.Replace("​", "").Trim().Length;
+        }
+
+        /// <summary>
+        /// Markdown の文字をブロックの並びにして（MarkdownConverter.ParseMarkdownBlocks）、キャレット位置に挿入する。
+        /// 文書の最上位の段落・見出しの中では、段落をキャレット位置で分けて、その間にブロックを入れる。貼る内容の
+        /// 最初・最後が通常の段落なら、分けた前後の文字とつなげる。最後が表・リスト等で、キャレットより後ろに文字が
+        /// 無い場合も、後ろに空の段落を置いてそこにキャレットを置く（表を貼った後と同じ。TableEditor.InsertParsedTable）。
+        /// 呼び出し側で RunAsProgrammaticChange の中から呼ぶこと。
+        /// </summary>
+        /// <param name="a_md">Markdown の文字（改行は LF）。</param>
+        /// <returns>挿入したか、呼び出し側で文字として挿入すべきか。</returns>
+        private MarkdownPasteKind TryInsertMarkdownBlocksAtCaret(string a_md)
+        {
+            List<Block> blocks = m_markdownConverter.ParseMarkdownBlocks(a_md);
+            if (0 == blocks.Count)
+            {
+                return MarkdownPasteKind.Fallback;
+            }
+            // 1つの通常の段落（<br> による続きの段落を含む）だけなら、これまで通り今の段落の中に挿入する
+            if (blocks[0] is Paragraph firstPara && null == firstPara.Tag &&
+                blocks.Skip(1).All(b => b is Paragraph p && p.Tag is BrContinuationInfo))
+            {
+                return MarkdownPasteKind.Inline;
+            }
+            TextPointer caret = m_editor.CaretPosition;
+            Paragraph para = ResolveParagraph(caret, m_editor.Document);
+            if (null == para)
+            {
+                return MarkdownPasteKind.Fallback;
+            }
+
+            // 箇条書きの項目の中にリストだけを貼る：今の項目の後ろに項目として加える（今の項目が空なら置き換える）
+            if (m_listEditor.IsInListItem(para, out ListItem li, out List parentList))
+            {
+                if (1 != blocks.Count || !(blocks[0] is List pastedList) || 0 == pastedList.ListItems.Count)
+                {
+                    return MarkdownPasteKind.Fallback;
+                }
+                var items = pastedList.ListItems.ToList();
+                pastedList.ListItems.Clear();
+                ListItem anchorItem = li;
+                foreach (ListItem item in items)
+                {
+                    parentList.ListItems.InsertAfter(anchorItem, item);
+                    anchorItem = item;
+                }
+                if (1 == li.Blocks.Count && IsParagraphEmpty(para))
+                {
+                    parentList.ListItems.Remove(li);
+                }
+                Paragraph lastItemPara = anchorItem.Blocks.FirstBlock as Paragraph;
+                m_editor.CaretPosition = (lastItemPara ?? (TextElement)anchorItem).ContentEnd;
+                return MarkdownPasteKind.Blocks;
+            }
+
+            // ここから先は、最上位の通常の段落・見出しの中に貼る場合だけ（表のセル・引用の中等は文字として貼る）
+            bool headingFlg = para.Tag is int level && level > 0;
+            if (!(para.Parent is FlowDocument doc) || !(null == para.Tag || headingFlg))
+            {
+                return MarkdownPasteKind.Fallback;
+            }
+
+            // キャレット位置で今の段落を分ける（キャレットより後ろの部分を tail に移す）
+            var tail = new Paragraph();
+            foreach (Inline moved in ListEditor.SplitInlinesAtCaret(para.Inlines, caret))
+            {
+                tail.Inlines.Add(moved);
+            }
+
+            // 最初のブロックが通常の段落なら、今の段落の続きにする（見出しの中は、改行を含まない場合だけ）
+            int start = 0;
+            bool mergedFirstFlg = false;
+            if (blocks[0] is Paragraph first && null == first.Tag &&
+                !(headingFlg && first.Inlines.OfType<LineBreak>().Any()))
+            {
+                var inlines = first.Inlines.ToList();
+                first.Inlines.Clear();
+                para.Inlines.AddRange(inlines);
+                start = 1;
+                mergedFirstFlg = true;
+            }
+            Block last = para;
+            for (int i = start; i < blocks.Count; i++)
+            {
+                doc.Blocks.InsertAfter(last, blocks[i]);
+                last = blocks[i];
+            }
+            // 今の段落が空のまま残った場合（空の行に見出し等を貼った場合）は取り除く
+            if (!mergedFirstFlg && !ReferenceEquals(last, para) && IsParagraphEmpty(para))
+            {
+                doc.Blocks.Remove(para);
+            }
+
+            // キャレットより後ろにあった文字を、最後のブロックが通常の段落ならその続きに、それ以外なら新しい段落にする
+            var tailInlines = tail.Inlines.ToList();
+            bool tailHasContentFlg = !IsParagraphEmpty(tail);
+            if (last is Paragraph lastPara && null == lastPara.Tag)
+            {
+                TextPointer caretPos = lastPara.ContentEnd;
+                if (tailHasContentFlg)
+                {
+                    tail.Inlines.Clear();
+                    lastPara.Inlines.AddRange(tailInlines);
+                    caretPos = tailInlines[0].ElementStart;
+                }
+                m_editor.CaretPosition = caretPos;
+            }
+            else
+            {
+                doc.Blocks.InsertAfter(last, tail);
+                m_editor.CaretPosition = tail.ContentStart;
+            }
+            m_editor.Selection.Select(m_editor.CaretPosition, m_editor.CaretPosition);
+            return MarkdownPasteKind.Blocks;
+        }
+
+        /// <summary>
+        /// 書式なしで貼り付ける（Ctrl+Shift+V。mdew・mdee と同じ）。クリップボードの文字を、Markdown の記号として
+        /// 読まずに、そのままキャレット位置に挿入する（改行は段落の中の改行になる）。コードブロックの中では、通常の
+        /// 貼り付け（文字のまま貼る）と同じ。
+        /// </summary>
+        private void PastePlainText()
+        {
+            string text;
+            try
+            {
+                text = Clipboard.ContainsText() ? Clipboard.GetText() : null;
+            }
+            catch (Exception ex)
+            {
+                DebugLogger.Log($"PastePlainText: クリップボードを読み取れなかった（{ex.Message}）");
+                return;
+            }
+            if (string.IsNullOrEmpty(text))
+            {
+                return;
+            }
+            var para = ResolveParagraph(m_editor.CaretPosition, m_editor.Document);
+            if (null != para && (para.Tag is CodeBlockInfo || para.Tag is CodeBlockContinuationInfo))
+            {
+                m_editor.Paste();
+                return;
+            }
+            text = text.Replace("\r\n", "\n").Replace("\r", "\n");
+            m_originalTextTracker.Invalidate(m_editor.CaretPosition);
+            RunAsProgrammaticChange(() =>
+            {
+                if (!m_editor.Selection.IsEmpty)
+                {
+                    m_editor.Selection.Text = "";
+                }
+                EnsureParagraphInEmptyDocument();
+                TextPointer end = m_markdownConverter.InsertPlainTextAtPosition(m_editor.CaretPosition, text);
+                m_editor.CaretPosition = end;
+                m_editor.Selection.Select(end, end);
+            });
+            m_outlineManager.Refresh();
+            MarkDirty();
+        }
+
+        /// <summary>
+        /// 押されたキーが書式のショートカットなら、その書式の名前を返す（InlineStyleEditor.
+        /// ToggleInlineStyleFromShortcut に渡す）。Ctrl+B：太字、Ctrl+I：斜体、Ctrl+U：下線、Alt+Shift+5：取り消し線、
+        /// Ctrl+Shift+@（英語キーボードは `）：インラインコード。
+        /// </summary>
+        /// <param name="a_args">キーのイベントの引数。</param>
+        /// <returns>書式の名前。ショートカットでなければ null。</returns>
+        private static string GetInlineStyleShortcut(KeyEventArgs a_args)
+        {
+            ModifierKeys modifiers = Keyboard.Modifiers;
+            Key key = Key.System == a_args.Key ? a_args.SystemKey : a_args.Key;
+            if (ModifierKeys.Control == modifiers)
+            {
+                switch (key)
+                {
+                    case Key.B: return "bold";
+                    case Key.I: return "italic";
+                    case Key.U: return "underline";
+                }
+            }
+            if ((ModifierKeys.Alt | ModifierKeys.Shift) == modifiers && (Key.D5 == key || Key.NumPad5 == key))
+            {
+                return "strikethrough";
+            }
+            if ((ModifierKeys.Control | ModifierKeys.Shift) == modifiers && Key.Oem3 == key)
+            {
+                return "code";
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// EditorPreviewKeyDown が処理しなかった Enter・BackSpace・Delete・Tab（WPF 標準の処理に任せるキー）で、
+        /// WPF 標準の処理の最中であることを記録する（ImeCaretMoveHelper.MarkWpfKeyCommandInProgress）。WPF は速く打たれて
+        /// まだ反映していない文字を、これらのキーの処理の始めにまとめて反映し、その TextChanged から自動変換が動くため。
+        /// </summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void EditorPreviewKeyDownUnhandled(object a_sender, KeyEventArgs a_args)
+        {
+            if (Key.Enter == a_args.Key || Key.Back == a_args.Key || Key.Delete == a_args.Key || Key.Tab == a_args.Key)
+            {
+                ImeCaretMoveHelper.MarkWpfKeyCommandInProgress(m_editor);
+            }
+        }
+
+        /// <summary>
+        /// キー入力の中心的な振り分け役。箇条書き項目・見出し・コードブロック・表セルの
+        /// いずれにキャレットがあるかに応じて、Tab/Shift+Tab/Enter/矢印キーの処理を
+        /// 対応するクラスへ委譲する。
+        /// </summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void EditorPreviewKeyDown(object a_sender, KeyEventArgs a_args)
+        {
+            // IME固まり調査用：Backspace・Delete・矢印キー・Ctrl+Z等の「文字を生成しないキー」も
+            // 漏れなく記録するため、ソースモード判定より前、関数の一番最初でログを取る。
+            // メッセージ文字列の組み立て（文字列補間）はC#の仕様上、DebugLogger.IsEnabledが
+            // falseでも評価されてしまうため、キー入力のたびに呼ばれるこの関数では明示的に
+            // IsEnabledで囲み、無効時は組み立てごと省略する。
+            if (DebugLogger.IsEnabled)
+            {
+                DebugLogger.Log(
+                    $"Editor.PreviewKeyDown: Key={a_args.Key} SystemKey={a_args.SystemKey} " +
+                    $"Modifiers={Keyboard.Modifiers} IsRepeat={a_args.IsRepeat}");
+            }
+
+            if (m_isSourceModeFlg)
+            {
+                return;
+            }
+            // 書式のショートカット（mdew・mdee と同じキー）。WPF の RichTextBox 標準の Ctrl+B・Ctrl+I・Ctrl+U は、
+            // mde の書式（Run の Tag）を付けずに見た目だけを変え、保存すると書式が消えるため、ここで代わりに処理する
+            // （文字を選んでいない時も、標準の処理は行わない）。
+            string shortcutStyle = GetInlineStyleShortcut(a_args);
+            if (null != shortcutStyle)
+            {
+                a_args.Handled = true;
+                m_inlineStyleEditor.ToggleInlineStyleFromShortcut(shortcutStyle);
+                return;
+            }
+            // 書式なしで貼り付け（mdew・mdee と同じ Ctrl+Shift+V）
+            if ((ModifierKeys.Control | ModifierKeys.Shift) == Keyboard.Modifiers && Key.V == a_args.Key)
+            {
+                a_args.Handled = true;
+                PastePlainText();
+                return;
+            }
+            var para = ResolveParagraph(m_editor.CaretPosition, m_editor.Document);
+            if (null == para)
+            {
+                // 表の最後のセルの末尾でEnterキーを押すと表が壊れる不具合（調査の詳細は
+                // ResolveParagraph・MarkdownConverter.MarkdownToDocumentのコメント参照）の
+                // 調査用ログ。本来この分岐に来ることはないはずだが、万一まだ来る場合に
+                // 備えて記録しておく。
+                if (DebugLogger.IsEnabled)
+                {
+                    DebugLogger.Log(
+                        "Editor.PreviewKeyDown: ResolveParagraphがnullを返したため、" +
+                        $"何もしなかった（Key={a_args.Key}）");
+                }
+                return;
+            }
+
+            if (a_args.Key == Key.Enter)
+            {
+                // Enterの直前に書いたメールアドレスは、mailtoのリンクにする（InlineStyleEditor.TryLinkifyBareEmail）
+                m_inlineStyleEditor.LinkifyBareEmailBeforeCaret();
+                if (m_listEditor.IsInListItem(para, out ListItem li, out List parentList))
+                {
+                    if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
+                    {
+                        a_args.Handled = true;
+                        // 箇条書き項目内での行内改行は、LineBreak要素ではなく段落分割方式を使う
+                        // （HeadingCodeBlockEditor.InsertParagraphSplitAtCaretのコメント参照。
+                        // IMEの入力位置がずれる不具合の対策）。コードブロックも同じ理由で
+                        // 段落分割方式（InsertCodeBlockContinuationParagraph。下のCodeBlockInfo
+                        // 分岐参照）を使う。
+                        m_headingCodeBlockEditor.InsertParagraphSplitAtCaret(para);
+                        return;
+                    }
+
+                    a_args.Handled = true;
+                    m_listEditor.HandleListEnter(li, parentList);
+                    return;
+                }
+                if (para.Tag is int level && level > 0)
+                {
+                    a_args.Handled = true;
+                    m_headingCodeBlockEditor.HandleHeadingEnter(para);
+                    return;
+                }
+                if (para.Tag is QuoteInfo || para.Tag is QuoteContinuationInfo)
+                {
+                    a_args.Handled = true;
+                    // 引用内のEnterは、コードブロックと同じく常に「同じ引用の続きの行」として
+                    // 次の行へ進める（Shift+Enterとの区別は無い）。以前はShift+Enterの時だけ
+                    // 続きの行を増やし、通常のEnterでは引用を抜けていたが、引用とコードブロックの
+                    // 操作が異なっていて分かりにくいとのご指摘を受けて、コードブロック側の操作
+                    // （Enterは常に続きの行を増やすだけで、抜けるには矢印キーやクリックで
+                    // 後続の段落へ移動する）に統一した。引用から抜けるための後続の通常の段落は
+                    // ConvertParagraphToQuoteが変換時に用意している。箇条書き項目・表のセルの
+                    // Shift+Enterと同じ理由（LineBreak要素とIMEの組み合わせによる、キャレット
+                    // 位置がずれる不具合。実機で確認済み）で、LineBreakベースのInsertLineBreak
+                    // AtCaretは使わず、段落分割方式のInsertQuoteContinuationParagraphを使う。
+                    m_headingCodeBlockEditor.InsertQuoteContinuationParagraph(para);
+                    return;
+                }
+                if (para.Tag is CodeBlockInfo || para.Tag is CodeBlockContinuationInfo)
+                {
+                    a_args.Handled = true;
+                    // コードブロック内のEnterは常に「同じコードブロックの続きの行」として
+                    // 次の行へ進める（Shift+Enterとの区別は無い。元々このブロックはEnterの
+                    // 修飾キーを見ていなかった）。引用・箇条書き項目・表のセルと同じ理由
+                    // （LineBreak要素とIMEの組み合わせによる、キャレット位置がずれる不具合。
+                    // 実機で確認済み）で、段落分割方式のInsertCodeBlockContinuationParagraph
+                    // を使う。
+                    m_headingCodeBlockEditor.InsertCodeBlockContinuationParagraph(para);
+                    return;
+                }
+                if (para.Parent is TableCell cellForEnter)
+                {
+                    if (ModifierKeys.Control == Keyboard.Modifiers)
+                    {
+                        // Ctrl+Enter：下に行を挿入する（mdew・mdee と同じ。右クリックの「下に行を挿入」と同じ）
+                        a_args.Handled = true;
+                        m_tableEditor.InsertRowBelowFromKey(cellForEnter);
+                        return;
+                    }
+                    if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
+                    {
+                        a_args.Handled = true;
+                        // 表のセル内での行内改行（Shift+Enter）は、箇条書き項目と同じ理由で
+                        // 段落分割方式を使う（上のListItem+Shift+Enterの分岐、および
+                        // HeadingCodeBlockEditor.InsertParagraphSplitAtCaretのコメント参照）。
+                        m_headingCodeBlockEditor.InsertParagraphSplitAtCaret(para);
+                        return;
+                    }
+
+                    a_args.Handled = true;
+                    // Enterキー単独では、Typora等の他のMarkdownエディタと同様、キャレットを
+                    // 下（同じ列）のセルへ移動する（ご要望により、以前あった「Enter単独での
+                    // セル内改行」はShift+Enterへ変更し、Enter単独はセル間移動用に空けた）。
+                    // 表の最終行だった場合は、MoveVertical内のMoveOutOfTableが表の外
+                    // （直後の段落。なければ新しく作る）へ移動する。上下矢印キーで既に
+                    // 使っている仕組みをそのまま再利用しているため、キャレットの移動先
+                    // （対象セルの最後の段落の末尾）は上下矢印キーの場合と同じになる。
+                    m_tableEditor.MoveVertical(cellForEnter, 1);
+                    return;
+                }
+                if (para.Parent is FlowDocument)
+                {
+                    string plainText = new TextRange(para.ContentStart, para.ContentEnd).Text.TrimEnd('\r', '\n');
+                    var fenceMatch = Regex.Match(plainText, "^```(\\S*)$");
+                    if (fenceMatch.Success)
+                    {
+                        a_args.Handled = true;
+                        m_headingCodeBlockEditor.ConvertParagraphToCodeBlock(para, fenceMatch.Groups[1].Value);
+                        return;
+                    }
+                    if (para.PreviousBlock is Table)
+                    {
+                        a_args.Handled = true;
+                        // 表の直後の段落でのEnterは、WPF標準の動作に任せると、キャレットが
+                        // 実際にはこの段落（表の外）にあるにもかかわらずWPFが表への行追加
+                        // として処理してしまい、表の罫線が壊れる不具合があった（詳細は
+                        // ResolveParagraph・InsertParagraphSplitAtCaretのコメント参照）。
+                        // そのため、箇条書き項目・表のセル内改行と同じ段落分割方式で自前で
+                        // 処理し、WPF標準の動作に一切渡さないようにする。
+                        m_headingCodeBlockEditor.InsertParagraphSplitAtCaret(para);
+                        return;
+                    }
+                    if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
+                    {
+                        a_args.Handled = true;
+                        // 通常の段落内でのShift+Enter（行内改行）も、引用・コードブロック・
+                        // 箇条書き項目・表のセルと全く同じ理由（LineBreak要素とIMEの組み合わせに
+                        // よる、キャレット位置がずれる不具合。実機で「Shift+Enterで行を増やしても、
+                        // 次の行にカーソルを移動して入力すると前の行の末尾に入力されてしまう」と
+                        // いう形で確認された）で、WPF標準のLineBreak挿入には任せず、段落分割方式の
+                        // InsertBrContinuationParagraphを使う。
+                        m_headingCodeBlockEditor.InsertBrContinuationParagraph(para);
+                        return;
+                    }
+                }
+                return; // 通常の段落、Enter単独: WPF標準の動作（新しい段落の作成）に任せる
+            }
+
+            // 箇条書き項目の続きの行の先頭でのBackSpaceは、同じ項目の前の段落の末尾へつなげる
+            // （ListEditor.TryMergeContinuationParagraphOnBackspace。WPF標準の動作だと、続きの行が
+            // 1段浅い新しい項目に変わり、入れ子のリストが途中で分断されていた）。
+            if (a_args.Key == Key.Back && ModifierKeys.None == Keyboard.Modifiers &&
+                m_listEditor.TryMergeContinuationParagraphOnBackspace(para))
+            {
+                a_args.Handled = true;
+                return;
+            }
+
+            // 見出し段落が空の状態でBackSpaceが押された場合、見出しの書式だけを本文へ戻す
+            // （箇条書きのListItemは同じ状況でWPF標準の動作のままリストを抜けられるが、
+            // 見出しはただのParagraphに書式を適用しているだけなので標準動作では外れない）。
+            // 空判定・キャレット末尾判定は、生のTextPointer比較ではなくTextRangeで取り出した
+            // 文字列の長さで行う：空にした段落には0文字のRunなど見えない構造が残ることがあり、
+            // TextPointer同士の比較では「空」と判定されないことがあるため。
+            // また、段落末尾（残り1文字などの状態）でのBackSpaceは、IME合成の部分確定の
+            // 繰り返しで段落内のRunが細分化された結果、WPF標準のBackSpaceコマンドが何も
+            // 削除せず反応しないことがある（TextChangedすら発生しないWPF側の不具合）。
+            // この症状は段落末尾でのみ確認されているため、段落末尾でのBackSpaceに限り標準
+            // 動作に頼らず自前で最後の1文字を削除する。
+            if (a_args.Key == Key.Back &&
+                para.Tag is int headingLevel && headingLevel > 0)
+            {
+                bool isEmptyFlg = 0 == new TextRange(para.ContentStart, para.ContentEnd).Text.TrimEnd('\r', '\n').Length;
+                bool isSelectionEmptyFlg = m_editor.Selection.IsEmpty;
+                bool isCaretAtEndFlg = isSelectionEmptyFlg &&
+                    0 == new TextRange(m_editor.Selection.Start, para.ContentEnd).Text.Length;
+                DebugLogger.Log(
+                    $"HeadingBackspaceCheck: level={headingLevel} isEmpty={isEmptyFlg} " +
+                    $"isSelectionEmpty={isSelectionEmptyFlg} isCaretAtEnd={isCaretAtEndFlg}");
+                if (isEmptyFlg && isSelectionEmptyFlg)
+                {
+                    a_args.Handled = true;
+                    m_headingCodeBlockEditor.RevertEmptyHeadingOnBackspace(para);
+                    return;
+                }
+                if (!isEmptyFlg && isCaretAtEndFlg)
+                {
+                    a_args.Handled = true;
+                    m_headingCodeBlockEditor.DeleteLastCharInHeading(para);
+                    return;
+                }
+                // 文字のある見出しの先頭でのBackSpaceも、見出しを通常の段落に戻す（mdew・mdeeと同じ）。
+                // WPF標準の動作に任せると、見出しの文字が前の段落の末尾につながって見出しが消えていた。
+                if (!isEmptyFlg && isSelectionEmptyFlg &&
+                    0 == new TextRange(para.ContentStart, m_editor.Selection.Start).Text.Length)
+                {
+                    a_args.Handled = true;
+                    m_headingCodeBlockEditor.RevertEmptyHeadingOnBackspace(para);
+                    return;
+                }
+            }
+
+            // 引用段落でのBackSpace処理。上の見出し向けの分岐と同じ判定方法（空判定・
+            // キャレット末尾判定はTextRangeの文字列長で行う）。
+            if (a_args.Key == Key.Back &&
+                (para.Tag is QuoteInfo || para.Tag is QuoteContinuationInfo))
+            {
+                bool isQuoteEmptyFlg = 0 == new TextRange(para.ContentStart, para.ContentEnd).Text.TrimEnd('\r', '\n').Length;
+                bool isQuoteSelectionEmptyFlg = m_editor.Selection.IsEmpty;
+                bool isQuoteCaretAtEndFlg = isQuoteSelectionEmptyFlg &&
+                    0 == new TextRange(m_editor.Selection.Start, para.ContentEnd).Text.Length;
+                DebugLogger.Log(
+                    $"QuoteBackspaceCheck: tag={para.Tag.GetType().Name} isEmpty={isQuoteEmptyFlg} " +
+                    $"isSelectionEmpty={isQuoteSelectionEmptyFlg} isCaretAtEnd={isQuoteCaretAtEndFlg}");
+                // 空の引用を本文へ戻す処理は、先頭行（QuoteInfo）の場合のみ行う。続きの行
+                // （QuoteContinuationInfo）が空の状態でBackSpaceが押された場合は、何もせず
+                // WPF標準の動作（前の段落の末尾へ段落を結合する＝続きの行を消す）に任せる。
+                // 続きの行には「前の行」が必ず存在するため、見出しのように本文へ戻す先が
+                // 無いということがなく、標準動作のままで自然な挙動になる。
+                if (isQuoteEmptyFlg && isQuoteSelectionEmptyFlg && para.Tag is QuoteInfo)
+                {
+                    a_args.Handled = true;
+                    // 空になった先頭行の直後に続きの行（QuoteContinuationInfo）が残っている
+                    // 場合、先頭行をそのまま本文へ戻すと続きの行だけが取り残されて見た目・
+                    // 保存内容が崩れるため、続きの行を新しい先頭行へ格上げする専用処理を使う。
+                    // 続きの行が無い（これが引用ブロック全体の最後の行）場合のみ、従来通り
+                    // 本文へ戻す。
+                    if (para.NextBlock is Paragraph nextQuoteContPara && nextQuoteContPara.Tag is QuoteContinuationInfo)
+                    {
+                        m_headingCodeBlockEditor.PromoteQuoteContinuationOnEmptyFirstLineBackspace(para, nextQuoteContPara);
+                    }
+                    else
+                    {
+                        m_headingCodeBlockEditor.RevertEmptyQuoteOnBackspace(para);
+                    }
+                    return;
+                }
+                if (!isQuoteEmptyFlg && isQuoteCaretAtEndFlg)
+                {
+                    a_args.Handled = true;
+                    m_headingCodeBlockEditor.DeleteLastCharInQuote(para);
+                    return;
+                }
+            }
+
+            // 引用の続きの行の先頭では、自前の段落結合を行う。WPF標準に任せると、段落削除と
+            // QuoteContinuationInfoの復元がUndoで分離され、見た目と保存内容がずれることがある。
+            if (a_args.Key == Key.Back && para.Tag is QuoteContinuationInfo &&
+                m_editor.Selection.IsEmpty &&
+                0 == new TextRange(para.ContentStart, m_editor.Selection.Start).Text.Length)
+            {
+                a_args.Handled = true;
+                m_headingCodeBlockEditor.MergeQuoteContinuationIntoPrevious(para);
+                return;
+            }
+
+            // 文字のあるコードブロックの先頭行の先頭でのBackSpaceは何もしない。WPF標準の動作に任せると、
+            // コードの1行目が前の段落（引用・見出し等）の末尾へつながり、コードが本文に混ざっていた。
+            // 1行だけの空のコードブロックは、これまで通り標準の動作（前の段落へつながって消える）のまま。
+            if (a_args.Key == Key.Back && ModifierKeys.None == Keyboard.Modifiers && para.Tag is CodeBlockInfo &&
+                m_editor.Selection.IsEmpty &&
+                0 == new TextRange(para.ContentStart, m_editor.Selection.Start).Text.Length &&
+                (0 < new TextRange(para.ContentStart, para.ContentEnd).Text.TrimEnd('\r', '\n').Length ||
+                 (para.NextBlock is Paragraph nextCodePara && nextCodePara.Tag is CodeBlockContinuationInfo)))
+            {
+                a_args.Handled = true;
+                return;
+            }
+
+            // コードブロックの続きの行（CodeBlockContinuationInfo）の先頭でBackSpaceが押された
+            // 場合のみ、自前の結合処理（MergeCodeBlockContinuationIntoPrevious）を使う。箱の
+            // 下側の枠線・余白が、結合で最後の行が変わった時に正しく付け替わるようにするため
+            // （詳細は同メソッドのコメント参照）。先頭行（CodeBlockInfo）の先頭でのBackSpace、
+            // および続きの行でもキャレットが先頭以外にある場合（通常の1文字削除）は、元々
+            // コードブロックに専用のBackSpace処理が無かった時と同じく、WPF標準の動作に任せる
+            // （挙動を変えない）。
+            if (a_args.Key == Key.Back && para.Tag is CodeBlockContinuationInfo)
+            {
+                bool isCodeCaretAtStartFlg = m_editor.Selection.IsEmpty &&
+                    0 == new TextRange(para.ContentStart, m_editor.Selection.Start).Text.Length;
+                if (isCodeCaretAtStartFlg)
+                {
+                    a_args.Handled = true;
+                    m_headingCodeBlockEditor.MergeCodeBlockContinuationIntoPrevious(para);
+                    return;
+                }
+            }
+
+            if (a_args.Key == Key.Tab && m_listEditor.IsInListItem(para, out ListItem tabLi, out List tabList))
+            {
+                a_args.Handled = true;
+                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
+                {
+                    m_listEditor.OutdentListItem(tabLi, tabList);
+                }
+                else
+                {
+                    m_listEditor.IndentListItem(tabLi, tabList);
+                }
+                return;
+            }
+
+            if (a_args.Key == Key.Tab && (para.Tag is CodeBlockInfo || para.Tag is CodeBlockContinuationInfo))
+            {
+                a_args.Handled = true;
+                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
+                {
+                    m_headingCodeBlockEditor.OutdentCodeLine(para);
+                }
+                else
+                {
+                    m_editor.Selection.Text = "\t";
+                    m_editor.CaretPosition = m_editor.Selection.End;
+                    m_editor.Selection.Select(m_editor.CaretPosition, m_editor.CaretPosition);
+                }
+                return;
+            }
+
+            if (a_args.Key == Key.Tab && para.Parent is TableCell tabCell &&
+                (ModifierKeys.None == Keyboard.Modifiers || ModifierKeys.Shift == Keyboard.Modifiers))
+            {
+                // 表のセルの中の Tab・Shift+Tab：次・前のセルへ移る（最後のセルの Tab は行を追加する。mdew・mdee と同じ）
+                a_args.Handled = true;
+                m_tableEditor.MoveByTab(tabCell, ModifierKeys.Shift == Keyboard.Modifiers);
+                return;
+            }
+            // 表のセルの先頭でのBackSpace・末尾でのDeleteは何もしない（mdew・mdeeと同じ）。WPF標準の
+            // 動作では前（次）のセルへ移り、押し続けると隣のセルの文字まで消えていた。
+            if (a_args.Key == Key.Delete && ModifierKeys.None == Keyboard.Modifiers && m_editor.Selection.IsEmpty &&
+                para.Parent is TableCell deleteCell && para == deleteCell.Blocks.LastBlock &&
+                0 <= m_editor.CaretPosition.GetInsertionPosition(LogicalDirection.Backward)
+                    .CompareTo(para.ContentEnd.GetInsertionPosition(LogicalDirection.Backward)))
+            {
+                a_args.Handled = true;
+                return;
+            }
+            if (a_args.Key == Key.Back && ModifierKeys.None == Keyboard.Modifiers && m_editor.Selection.IsEmpty &&
+                para.Parent is TableCell backCell && para == backCell.Blocks.FirstBlock &&
+                0 >= m_editor.CaretPosition.GetInsertionPosition(LogicalDirection.Forward)
+                    .CompareTo(para.ContentStart.GetInsertionPosition(LogicalDirection.Forward)))
+            {
+                a_args.Handled = true;
+                return;
+            }
+            if (para.Parent is TableCell cell)
+            {
+                if (a_args.Key == Key.Up ||
+                    a_args.Key == Key.Down)
+                {
+                    a_args.Handled = true;
+                    m_tableEditor.MoveVertical(cell, a_args.Key == Key.Up ? -1 : 1);
+                }
+                else if (a_args.Key == Key.Left && m_tableEditor.IsCaretAtStart(cell))
+                {
+                    a_args.Handled = true;
+                    m_tableEditor.MoveHorizontal(cell, -1);
+                }
+                else if (a_args.Key == Key.Right && m_tableEditor.IsCaretAtEnd(cell))
+                {
+                    a_args.Handled = true;
+                    m_tableEditor.MoveHorizontal(cell, 1);
+                }
+            }
+        }
+
+        // ======================================================================
+        //  右クリックメニュー
+        // ======================================================================
+
+        /// <summary>
+        /// 右クリック位置の下に何があるか（段落・表セル・画像・リンク）を判定し、対応する
+        /// メニュー項目の表示/非表示を切り替える。判定結果は各クラスの専用プロパティ
+        /// （TableEditor.ContextCellなど）へ格納し、以後のメニュー項目クリックから
+        /// 参照できるようにする。
+        /// </summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void EditorContextMenuOpening(object a_sender, ContextMenuEventArgs a_args)
+        {
+            if (m_isSourceModeFlg) { a_args.Handled = true; return; }
+
+            Point pos = Mouse.GetPosition(m_editor);
+            TextPointer tp = m_editor.GetPositionFromPoint(pos, true);
+            m_ctxParagraph = tp?.Paragraph;
+            m_tableEditor.ContextCell = m_ctxParagraph?.Parent as TableCell;
+            m_tableEditor.ContextParagraph = m_ctxParagraph;
+            m_inlineStyleEditor.ContextParagraph = m_ctxParagraph;
+
+            var hit = VisualTreeHelper.HitTest(m_editor, pos);
+            m_imageManager.ContextImage = FindVisualAncestorOrSelf<Image>(hit?.VisualHit);
+
+            var linkRun = tp?.Parent as Run;
+            m_inlineStyleEditor.ContextLinkRun = linkRun?.Tag is LinkInfo ? linkRun : null;
+
+            bool inTableFlg = null != m_tableEditor.ContextCell;
+            bool inCodeBlockFlg = m_ctxParagraph?.Tag is CodeBlockInfo || m_ctxParagraph?.Tag is CodeBlockContinuationInfo;
+            m_headingMenuItem.Visibility = inTableFlg ? Visibility.Collapsed : Visibility.Visible;
+            m_insertTableMenuItem.Visibility = inTableFlg ? Visibility.Collapsed : Visibility.Visible;
+            m_insertRowAboveMenuItem.Visibility = inTableFlg ? Visibility.Visible : Visibility.Collapsed;
+            m_insertRowBelowMenuItem.Visibility = inTableFlg ? Visibility.Visible : Visibility.Collapsed;
+            m_insertColumnLeftMenuItem.Visibility = inTableFlg ? Visibility.Visible : Visibility.Collapsed;
+            m_insertColumnRightMenuItem.Visibility = inTableFlg ? Visibility.Visible : Visibility.Collapsed;
+            m_adjustColumnWidthsMenuItem.Visibility = inTableFlg ? Visibility.Visible : Visibility.Collapsed;
+            m_deleteRowMenuItem.Visibility = inTableFlg ? Visibility.Visible : Visibility.Collapsed;
+            m_deleteColumnMenuItem.Visibility = inTableFlg ? Visibility.Visible : Visibility.Collapsed;
+            m_deleteTableMenuItem.Visibility = inTableFlg ? Visibility.Visible : Visibility.Collapsed;
+            m_copyTableMenuItem.Visibility = inTableFlg ? Visibility.Visible : Visibility.Collapsed;
+            m_copyCodeBlockMenuItem.Visibility = inCodeBlockFlg ? Visibility.Visible : Visibility.Collapsed;
+            m_copyForExcelMenuItem.Visibility = (!m_editor.Selection.IsEmpty) ? Visibility.Visible : Visibility.Collapsed;
+            m_openImageMenuItem.Visibility = null != m_imageManager.ContextImage ? Visibility.Visible : Visibility.Collapsed;
+            m_saveImageMenuItem.Visibility = null != m_imageManager.ContextImage ? Visibility.Visible : Visibility.Collapsed;
+            m_deleteImageMenuItem.Visibility = null != m_imageManager.ContextImage ? Visibility.Visible : Visibility.Collapsed;
+            m_textStyleMenuItem.Visibility = (!m_editor.Selection.IsEmpty) ? Visibility.Visible : Visibility.Collapsed;
+            m_linkMenuItem.Visibility = null != m_inlineStyleEditor.ContextLinkRun ? Visibility.Visible : Visibility.Collapsed;
+            m_toggleModeMenuItem.Header = m_isSourceModeFlg ? "Markdownモードに切り替え" : "ソースモードに切り替え";
+            m_ctxFolderPaneMenuItem.IsChecked = m_folderPaneVisibleFlg;
+            m_ctxOutlinePaneMenuItem.IsChecked = m_outlinePaneVisibleFlg;
+            UpdateHeadingMenuState();
+        }
+
+        /// <summary>右クリックメニューの「見出し」項目に、現在カーソルがある段落の見出し
+        /// レベルを反映する。トップレベルの表示（見出し部分の見出しレベル）を"見出しN"
+        /// （本文の場合は"見出し"のまま）に更新し、サブメニュー側は現在のレベルに一致する
+        /// 項目だけにチェックを付ける（他はチェックを外す）。段落のTagは、見出しレベルが
+        /// 1以上ならint、本文ならnull、コードブロックならCodeBlockInfoが入っている
+        /// （BlockStyles.ApplyHeadingStyle参照）ため、int以外はすべて「本文（レベル0）」
+        /// として扱う。</summary>
+        private void UpdateHeadingMenuState()
+        {
+            int headingLevel = m_ctxParagraph?.Tag is int lvl ? lvl : 0;
+            m_headingMenuItem.Header = 0 == headingLevel ? "見出し" : "見出し" + headingLevel;
+            foreach (var item in m_headingMenuItem.Items.OfType<MenuItem>())
+            {
+                item.IsChecked = (string)item.Tag == headingLevel.ToString();
+            }
+        }
+
+        /// <summary>ソースモードの右クリックメニューを開く時：フォルダ・アウトラインの表示の ✓ を、今の状態に合わせる。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void SourceEditorContextMenuOpening(object a_sender, ContextMenuEventArgs a_args)
+        {
+            m_sourceCtxFolderPaneMenuItem.IsChecked = m_folderPaneVisibleFlg;
+            m_sourceCtxOutlinePaneMenuItem.IsChecked = m_outlinePaneVisibleFlg;
+        }
+
+        // ---- 見出し ----
+
+        /// <summary>右クリックメニューから見出しレベルを変更する。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void HeadingItemClick(object a_sender, RoutedEventArgs a_args)
+        {
+            if (null == m_ctxParagraph)
+            {
+                return;
+            }
+            int level = int.Parse((string)((MenuItem)a_sender).Tag);
+            m_headingCodeBlockEditor.ChangeHeadingLevel(m_ctxParagraph, level);
+            m_outlineManager.Refresh();
+            MarkDirty();
+        }
+
+        // ---- 表 ----
+
+        private void InsertTableItemClick(object a_sender, RoutedEventArgs a_args)
+        {
+            m_tableEditor.ContextParagraph = m_ctxParagraph;
+            var dlg = new TableSizeDialog { Owner = this };
+            if (true == dlg.ShowDialog())
+            {
+                m_tableEditor.InsertTable(dlg.Rows, dlg.Columns);
+            }
+        }
+
+        private void InsertRowAboveItemClick(object a_sender, RoutedEventArgs a_args) => m_tableEditor.InsertRow(a_aboveFlg: true);
+        private void InsertRowBelowItemClick(object a_sender, RoutedEventArgs a_args) => m_tableEditor.InsertRow(a_aboveFlg: false);
+        private void InsertColumnLeftItemClick(object a_sender, RoutedEventArgs a_args) => m_tableEditor.InsertColumn(a_leftFlg: true);
+        private void InsertColumnRightItemClick(object a_sender, RoutedEventArgs a_args) => m_tableEditor.InsertColumn(a_leftFlg: false);
+
+        /// <summary>右クリックメニュー「列幅を調整…」。ContextCellが属する表の列ごとの
+        /// ラベル・現在の幅をTableEditorから取得してダイアログを開き、OKが押されたら
+        /// TableEditorへ適用させる（表を挿入する際のInsertTableItemClickと同じ、ダイアログは
+        /// MainWindow側で開き、実際の適用処理はTableEditorに委譲するパターン）。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void AdjustColumnWidthsItemClick(object a_sender, RoutedEventArgs a_args)
+        {
+            var info = m_tableEditor.GetColumnWidthDialogInfo();
+            if (null == info.Labels)
+            {
+                return;
+            }
+            var dlg = new ColumnWidthDialog(info.Labels, info.DashCounts, info.IsAutoCalculated) { Owner = this };
+            if (true == dlg.ShowDialog())
+            {
+                m_tableEditor.ApplyColumnWidths(dlg.DashCounts);
+            }
+        }
+
+        private void DeleteRowItemClick(object a_sender, RoutedEventArgs a_args) => m_tableEditor.DeleteRow();
+        private void DeleteColumnItemClick(object a_sender, RoutedEventArgs a_args) => m_tableEditor.DeleteColumn();
+        private void DeleteTableItemClick(object a_sender, RoutedEventArgs a_args) => m_tableEditor.DeleteTable();
+        private void CopyTableItemClick(object a_sender, RoutedEventArgs a_args) => m_tableEditor.CopyTable();
+
+        /// <summary>右クリックメニュー「Excel用にコピー」。選択範囲を、見た目を保ったまま
+        /// Excelへ貼り付けられる形式（TSV・CF_HTML）でクリップボードへコピーする。表のセル
+        /// 範囲にきっちり収まる選択はTableEditor側、それ以外（見出し・段落・箇条書き・表が
+        /// 混在する選択等）はClipboardHtmlBuilder側が担当する（登録順ではなく、戻り値による
+        /// 判定に変更した点を除き、以前Ctrl+Cを乗っ取っていた頃と同じ優先順位）。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void CopyForExcelItemClick(object a_sender, RoutedEventArgs a_args)
+        {
+            if (!m_tableEditor.TryCopySelectionForExcel())
+            {
+                m_clipboardHtmlBuilder.TryCopySelectionForExcel();
+            }
+        }
+
+        // ---- 画像 ----
+
+        /// <summary>右クリックメニュー「画像を開く」。ダブルクリック時と同じ
+        /// ImageManager.OpenImageFileを、右クリック位置の画像（ContextImage）に対して呼ぶ。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void OpenImageItemClick(object a_sender, RoutedEventArgs a_args)
+        {
+            if (null != m_imageManager.ContextImage)
+            {
+                m_imageManager.OpenImageFile(m_imageManager.ContextImage);
+            }
+        }
+
+        private void SaveImageItemClick(object a_sender, RoutedEventArgs a_args) => m_imageManager.SaveImageAs(this);
+
+        /// <summary>右クリックメニュー「画像を削除」。右クリック位置の画像（ContextImage）を
+        /// ImageManager.DeleteImageで削除する。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void DeleteImageItemClick(object a_sender, RoutedEventArgs a_args)
+        {
+            if (null != m_imageManager.ContextImage)
+            {
+                m_imageManager.DeleteImage(m_imageManager.ContextImage);
+            }
+        }
+
+        // ---- コードブロック ----
+
+        private void CopyCodeBlockItemClick(object a_sender, RoutedEventArgs a_args) => m_inlineStyleEditor.CopyCodeBlockAsMarkdown();
+
+        // ---- 文字装飾・リンク ----
+
+        private void TextStyleItemClick(object a_sender, RoutedEventArgs a_args)
+        {
+            string style = (string)((MenuItem)a_sender).Tag;
+            m_inlineStyleEditor.ApplyTextStyleFromMenu(style, this);
+        }
+
+        private void LinkOpenClick(object a_sender, RoutedEventArgs a_args) => m_inlineStyleEditor.OpenContextLink();
+        private void LinkCopyUrlClick(object a_sender, RoutedEventArgs a_args) => m_inlineStyleEditor.CopyContextLinkUrl();
+        private void LinkEditClick(object a_sender, RoutedEventArgs a_args) => m_inlineStyleEditor.EditContextLink(this);
+        private void LinkRemoveClick(object a_sender, RoutedEventArgs a_args) => m_inlineStyleEditor.RemoveContextLink();
+
+        /// <summary>エディタ上でのマウス左ボタン押下を処理する。ダブルクリック位置が画像の上
+        /// だった場合は、リンク先の画像ファイルを開くことを優先する（Ctrl+クリックでの
+        /// リンク開きより先に判定する）。それ以外は通常通りInlineStyleEditorのリンククリック
+        /// 処理へ委譲する。画像の判定は右クリックメニュー（EditorContextMenuOpening）と同じ、
+        /// RichTextBox側からのVisualTreeHelper.HitTestを使う方式に統一している：RichTextBoxに
+        /// 埋め込まれたInlineUIContainerの子要素は、マウスイベントの到達やカーソル表示が内部の
+        /// テキスト編集処理と絡んで不安定になることがあるため。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void EditorPreviewMouseLeftButtonDown(object a_sender, MouseButtonEventArgs a_args)
+        {
+            // スクロールバーのクリックは、スクロールバーにそのまま任せる（文書の中の要素のクリックとして扱わない）。
+            // これが無いと、スクロールバーをクリックした高さと同じ行にリンクがある時に、そのリンクを開いてしまっていた
+            // （InlineStyleEditor.HandlePreviewMouseLeftButtonDown 参照）。
+            if (null != FindVisualAncestorOrSelf<System.Windows.Controls.Primitives.ScrollBar>(a_args.OriginalSource as DependencyObject))
+            {
+                return;
+            }
+            Point pos = a_args.GetPosition(m_editor);
+            var hit = VisualTreeHelper.HitTest(m_editor, pos);
+
+            // タスクリストのチェックボックス（[ ]/[x]）のクリックによるチェック⇔アンチェック
+            // 切替。画像と同じ理由でRichTextBox側のヒットテストで検出し、IsCheckedを手動で
+            // 反転させたうえで「元テキスト保持」の記憶破棄も直接・同期的に呼ぶ（IsChecked変更に
+            // RunAsProgrammaticChangeを使わないのは、実際のユーザー操作として扱うため）。
+            CheckBox cb = FindVisualAncestorOrSelf<CheckBox>(hit?.VisualHit);
+            if (null != cb && "task-checkbox" == (cb.Tag as string))
+            {
+                a_args.Handled = true;
+                cb.IsChecked = !(true == cb.IsChecked);
+                InvalidateTaskCheckboxBlock(cb);
+                return;
+            }
+
+            Image img = FindVisualAncestorOrSelf<Image>(hit?.VisualHit);
+            if (img?.Tag is ImageInfo imageInfo && !string.IsNullOrWhiteSpace(imageInfo.LinkUrl) &&
+                m_inlineStyleEditor.HandleImageLinkClick(imageInfo.LinkUrl))
+            {
+                a_args.Handled = true;
+                return;
+            }
+
+            if (a_args.ClickCount >= 2)
+            {
+                if (null != img)
+                {
+                    a_args.Handled = true;
+                    m_imageManager.OpenImageFile(img);
+                    return;
+                }
+            }
+            m_inlineStyleEditor.HandlePreviewMouseLeftButtonDown(a_sender, a_args);
+        }
+
+        // ======================================================================
+        //  視覚ツリーのヘルパー（EditorContextMenuOpening・EditorPreviewMouseLeftButtonDownで使用）
+        // ======================================================================
+
+        /// <summary>指定した型の、最も近い視覚ツリーの祖先（またはその要素自身）を見つける。</summary>
+        /// <param name="a_start">探索を始める要素。文書の中の段落・Run 等（Visual ではない要素。クリックした時の
+        /// MouseButtonEventArgs.OriginalSource になることがある）の場合は、論理ツリーの親をたどる
+        /// （VisualTreeHelper.GetParent は Visual 以外を渡すと例外になるため）。</param>
+        /// <returns>見つかった要素。なければ null。</returns>
+        private static T FindVisualAncestorOrSelf<T>(DependencyObject a_start) where T : DependencyObject
+        {
+            var current = a_start;
+            while (null != current)
+            {
+                if (current is T match)
+                {
+                    return match;
+                }
+                current = (current is Visual || current is System.Windows.Media.Media3D.Visual3D)
+                    ? VisualTreeHelper.GetParent(current)
+                    : LogicalTreeHelper.GetParent(current);
+            }
+            return null;
+        }
+
+        // ======================================================================
+        //  モード切り替え（Markdown ⇔ ソース）
+        // ======================================================================
+
+        /// <summary>Markdownモード（WYSIWYG）とソースモード（生テキスト）を切り替える。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void ToggleModeBtnClick(object a_sender, RoutedEventArgs a_args)
+        {
+            bool wasDirtyFlg = m_currentFileIsDirtyFlg;
+
+            if (!m_isSourceModeFlg)
+            {
+                // モード切替の前後でカーソル位置が大きくずれないよう、切替前にカーソルが
+                // あったトップレベルブロック（段落・見出し・箇条書き・表など）を覚えておき、
+                // 変換後のMarkdown文字列の中で、そのブロックに対応する開始位置へキャレットを
+                // 移動する（文字単位ではなくブロック単位での近似的な復元）。
+                Block caretBlock = m_originalTextTracker.GetTopLevelBlock(m_editor.CaretPosition);
+
+                m_sourceEditor.Text = m_markdownConverter.DocumentToMarkdown(m_editor.Document);
+                m_editor.Visibility = Visibility.Collapsed;
+                m_sourceEditor.Visibility = Visibility.Visible;
+                m_isSourceModeFlg = true;
+                m_toggleModeBtn.Content = "Markdownモードに切替";
+
+                // Focus()はCaretIndex・スクロール位置の設定が終わった後に呼ぶ：先にFocus()すると、
+                // TextBoxがフォーカス受け取り時に「その時点の（更新前の）CaretIndex」を基準に
+                // 自動スクロールしようとする内部処理と競合するため。
+                if (null != caretBlock)
+                {
+                    int offset = m_markdownConverter.GetMarkdownOffsetForBlock(m_editor.Document, caretBlock);
+                    DebugLogger.Log($"ToggleModeBtnClick(→Source): offset={offset} textLen={m_sourceEditor.Text.Length}");
+                    if (offset >= 0 && offset <= m_sourceEditor.Text.Length)
+                    {
+                        // CaretIndexを先に確定させてからUpdateLayout()する：m_sourceEditorは
+                        // それまでVisibility.Collapsedでレイアウト対象外だったため、逆の順序だと
+                        // Visibleにした直後の古い（既定0の）CaretIndexを基準にレイアウトの
+                        // 内部情報が確定してしまう。
+                        m_sourceEditor.CaretIndex = offset;
+                        m_sourceEditor.UpdateLayout();
+                        int line = m_sourceEditor.GetLineIndexFromCharacterIndex(offset);
+                        DebugLogger.Log($"ToggleModeBtnClick(→Source): line={line} caretIndex={m_sourceEditor.CaretIndex}");
+                        if (line >= 0)
+                        {
+                            // ScrollToLineは「見えていなければ最小限だけスクロールする」仕様のため、
+                            // 既に見えている行だと一番上への移動が起きないことがある（他のスクロール
+                            // 処理と同じ対策で、先に先頭へリセットしてから対象行へスクロールする）。
+                            // リセットの間にUpdateLayout()を挟むのは、それが反映される前に次の
+                            // ScrollToLineの可視判定が走ってしまうのを防ぐため。
+                            m_sourceEditor.ScrollToLine(0);
+                            m_sourceEditor.UpdateLayout();
+                            m_sourceEditor.ScrollToLine(line);
+                        }
+                    }
+                }
+
+                m_sourceEditor.Focus();
+            }
+            else
+            {
+                // 逆方向（ソース→Markdown）は、以下の2つを別々に扱う。
+                //  (a) キャレット（カーソル）の位置：ソース側でのキャレット位置に対応する
+                //      Markdown側のブロックへ、そのままキャレットを移動する（そのまま編集を
+                //      続けられるようにするため）。
+                //  (b) 画面に表示する位置（スクロール）：ソース側で実際に画面の一番上に見えて
+                //      いた行に対応するMarkdown側のブロックを、切替後も画面の一番上に表示する
+                //      （見ていた内容をそのまま見せ続けるため）。
+                //
+                // m_sourceEditorはTextWrapping="Wrap"のため、GetLineIndexFromCharacterIndex・
+                // GetFirstVisibleLineIndex等が返す「行」は折り返し後の表示行であり、Markdown
+                // ソースの改行（\n）で区切った論理行とは一致しない。一方FindBlockIndexForSourceLine
+                // は論理行のインデックスを期待するため、表示行番号をそのまま渡すと（折り返しで
+                // 2行以上になる行が手前にあった場合に）ずれた段落を指してしまう。そのため、
+                // キャレット位置は文字インデックス（CaretIndex、折り返しの影響を受けない）から、
+                // 画面の一番上に見えている位置はGetCharacterIndexFromLineIndexで一旦文字
+                // インデックスに変換してから、それぞれ論理行番号を数え直す。
+                string sourceText = m_sourceEditor.Text;
+                int caretIndexAtToggle = m_sourceEditor.CaretIndex;
+                int caretLine = GetLogicalLineIndexForCharacterOffset(sourceText, caretIndexAtToggle);
+
+                int firstVisibleDisplayLine = m_sourceEditor.GetFirstVisibleLineIndex();
+                int scrollAnchorCharIndex = (firstVisibleDisplayLine >= 0)
+                    ? m_sourceEditor.GetCharacterIndexFromLineIndex(firstVisibleDisplayLine)
+                    : -1;
+                int scrollAnchorLine = (scrollAnchorCharIndex >= 0)
+                    ? GetLogicalLineIndexForCharacterOffset(sourceText, scrollAnchorCharIndex)
+                    : -1;
+                DebugLogger.Log($"ToggleModeBtnClick(→Markdown): caretIndex={caretIndexAtToggle} caretLine={caretLine} firstVisibleDisplayLine={firstVisibleDisplayLine} scrollAnchorCharIndex={scrollAnchorCharIndex} scrollAnchorLine={scrollAnchorLine}");
+
+                RunAsProgrammaticChange(() => m_markdownConverter.MarkdownToDocument(sourceText, m_editor.Document));
+                m_sourceEditor.Visibility = Visibility.Collapsed;
+                m_editor.Visibility = Visibility.Visible;
+                m_isSourceModeFlg = false;
+                m_toggleModeBtn.Content = "ソースモードに切替";
+                m_outlineManager.Refresh();
+
+                int caretBlockIndex = caretLine >= 0
+                    ? m_markdownConverter.FindBlockIndexForSourceLine(m_editor.Document, sourceText, caretLine)
+                    : -1;
+                int scrollAnchorBlockIndex = scrollAnchorLine >= 0
+                    ? m_markdownConverter.FindBlockIndexForSourceLine(m_editor.Document, sourceText, scrollAnchorLine)
+                    : -1;
+                DebugLogger.Log($"ToggleModeBtnClick(→Markdown): caretBlockIndex={caretBlockIndex} scrollAnchorBlockIndex={scrollAnchorBlockIndex} blocksCount={m_editor.Document.Blocks.Count}");
+
+                Block caretBlock = (caretBlockIndex >= 0 && caretBlockIndex < m_editor.Document.Blocks.Count)
+                    ? m_editor.Document.Blocks.ElementAt(caretBlockIndex)
+                    : null;
+                Block scrollAnchorBlock = (scrollAnchorBlockIndex >= 0 && scrollAnchorBlockIndex < m_editor.Document.Blocks.Count)
+                    ? m_editor.Document.Blocks.ElementAt(scrollAnchorBlockIndex)
+                    : null;
+
+                // (a) キャレットの移動。対応するブロックが見つからない場合は、既存の（＝この
+                // カーソル位置復元機能を追加する前からの）挙動と同じく、文書の先頭へ設定する。
+                m_editor.CaretPosition = (null != caretBlock) ? caretBlock.ContentStart : m_editor.Document.ContentStart;
+
+                // (b) 画面のスクロール。m_editorはVisibility.Collapsed→Visibleに変わった
+                // ばかりでレイアウトが確定していない可能性があるため、先にUpdateLayout()で
+                // 確定させ、一旦スクロール位置を先頭へリセットしてから（他のスクロール処理と
+                // 同じ「既に見えていれば何も起きない」問題への対策）、改めてスクロール先の
+                // 段落を一番上へ表示する。
+                m_editor.UpdateLayout();
+                // 表の列幅・画像の大きさは、文書を作った時（編集ペインが隠れていて幅が分からない時）の仮の幅で決まって
+                // いるため、表示された今の幅で計算し直す（EditorSizeChanged と同じ）
+                ApplyDocumentWidth();
+                RefreshImageAndTableWidths();
+                m_editor.UpdateLayout();
+                if (null == m_editorScrollViewer)
+                {
+                    m_editorScrollViewer = FindVisualChild<ScrollViewer>(m_editor);
+                }
+                m_editorScrollViewer?.ScrollToVerticalOffset(0);
+                m_editor.UpdateLayout();
+                // BringIntoViewは「見えるようにするための最小限のスクロール」しか行わないため、
+                // 対象の段落が必ず画面の一番上に来るとは限らない。RestoreEditorScrollAnchorと
+                // 同じ考え方で、その段落の先頭が画面の何ピクセル目に来ているか
+                // （GetCharacterRectはビューポート基準の相対座標を返す）を確認して補正する。
+                // 比較対象はm_editor.Padding.Top（スクロールしない上の余白。今は0で、文書の上の余白は
+                // スクロールする FlowDocument.PagePadding 側にある。EDITOR_TOP_PADDING参照）：内容が一番上に
+                // 来ている状態でのGetCharacterRectのTopは、このPadding分になるため。
+                Block scrollTargetBlock = scrollAnchorBlock ?? caretBlock;
+                if (null != scrollTargetBlock)
+                {
+                    scrollTargetBlock.BringIntoView();
+                    m_editor.UpdateLayout();
+                    if (null != m_editorScrollViewer)
+                    {
+                        Rect startRect = scrollTargetBlock.ContentStart.GetCharacterRect(LogicalDirection.Forward);
+                        double naturalTopRestingPosition = m_editor.Padding.Top;
+                        DebugLogger.Log($"ToggleModeBtnClick(→Markdown): afterBringIntoView verticalOffset={m_editorScrollViewer.VerticalOffset} startRectTop={startRect.Top} naturalTopRestingPosition={naturalTopRestingPosition}");
+                        double delta = startRect.Top - naturalTopRestingPosition;
+                        if (0 != delta)
+                        {
+                            m_editorScrollViewer.ScrollToVerticalOffset(m_editorScrollViewer.VerticalOffset + delta);
+                        }
+                    }
+                }
+
+                m_editor.Focus();
+            }
+
+            // 表示モードの切り替えは、同じ内容を表示し直しているだけなので、それ自体で
+            // ファイルが「未保存」扱いになってしまってはいけない。
+            m_currentFileIsDirtyFlg = wasDirtyFlg;
+            m_folderTreeManager.RefreshDirtyMarkers();
+        }
+
+        // ======================================================================
+        //  新規作成 / 開く / 保存 / 名前を付けて保存
+        // ======================================================================
+        //  実際の処理はFileOperationsManagerへ委譲している。以下はXAMLのClick=や、
+        //  MainWindowPreviewKeyDown等の内部呼び出しがそのまま参照できるようにするための
+        //  薄いラッパー（PDF書き出しのみ、両版で内容が異なるためこのファイルに残している）。
+        // ======================================================================
+
+        /// <summary>新しいウィンドウを開く（詳細はFileOperationsManager.NewBtnClick参照）。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void NewBtnClick(object a_sender, RoutedEventArgs a_args) => m_fileOperationsManager.NewBtnClick(a_sender, a_args);
+
+        /// <summary>このウィンドウを閉じる（詳細はFileOperationsManager.CloseBtnClick参照）。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void CloseBtnClick(object a_sender, RoutedEventArgs a_args) => m_fileOperationsManager.CloseBtnClick(a_sender, a_args);
+
+        /// <summary>ファイルを開くダイアログを表示する（詳細はFileOperationsManager.OpenWithDialog参照）。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void OpenBtnClick(object a_sender, RoutedEventArgs a_args) => m_fileOperationsManager.OpenWithDialog();
+
+        /// <summary>指定したファイルを読み込む（詳細はFileOperationsManager.LoadFile参照）。他のウィンドウ
+        /// （newWindow.LoadFile）や起動時処理から直接呼ばれるため、このラッパーは維持している。</summary>
+        /// <param name="a_path">読み込むファイルの絶対パス。</param>
+        private void LoadFile(string a_path) => m_fileOperationsManager.LoadFile(a_path);
+
+        /// <summary>現在のファイルを保存する（詳細はFileOperationsManager.SaveBtnClick参照）。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void SaveBtnClick(object a_sender, RoutedEventArgs a_args) => m_fileOperationsManager.SaveBtnClick(a_sender, a_args);
+
+        /// <summary>「名前を付けて保存」ダイアログを開く（詳細はFileOperationsManager.SaveAsBtnClick参照）。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void SaveAsBtnClick(object a_sender, RoutedEventArgs a_args) => m_fileOperationsManager.SaveAsBtnClick(a_sender, a_args);
+
+        /// <summary>「名前を付けて保存」を実行する（詳細はFileOperationsManager.SaveAs参照）。
+        /// MainWindowPreviewKeyDownのShift+Ctrl+Sから直接呼ばれるため、このラッパーは維持している。</summary>
+        private void SaveAs() => m_fileOperationsManager.SaveAs();
+
+        /// <summary>
+        /// 現在の文書をPDFへ書き出す（Chromiumなし版）。追加ライブラリを使わず、Windows標準の
+        /// 「Microsoft Print to PDF」仮想プリンタへの印刷として実現する（印刷ダイアログでこの
+        /// プリンタを選ぶとPDF保存になる）。Chromiumあり版（headless Chromiumでの書き出し。
+        /// ソースモードでの書き出し・既定ファイル名の指定・書き出し後の自動オープンに対応）を
+        /// 使えない環境向けの、依存関係なしの代替実装。WPFの印刷パイプラインが文書のVisualを
+        /// そのまま描画するため、チェックボックスやハイライト等も個別対応なしに書き出せる。
+        /// </summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void ExportPdfBtnClick(object a_sender, RoutedEventArgs a_args)
+        {
+            if (m_isSourceModeFlg)
+            {
+                MessageBox.Show("PDFへの書き出しはMarkdownモードでのみ利用できます。", "PDFに書き出し",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            var dlg = new System.Windows.Controls.PrintDialog();
+            if (true != dlg.ShowDialog())
+            {
+                return;
+            }
+
+            // これ以降、書き出しのためだけにリンクの一時置換・画像サイズの一時縮小・
+            // ColumnWidthの変更を行うが、これらはRichTextBoxのTextChangedを発生させるため、
+            // RunWithoutDirtyMarking（検索ハイライトの適用/解除と同じ仕組み）で囲んで
+            // ダーティフラグが立たないようにする。
+            RunWithoutDirtyMarking(() =>
+            {
+                // mdeのリンクは独自のLinkInfoタグ付きRunで表現され、WPF標準のHyperlinkでは
+                // ないため、そのままではPDF上でクリックできない。書き出し中だけ本物のHyperlink
+                // に一時置換する。外部URLはNavigateUriへそのまま、見出しへのアンカーリンク
+                // （#始まり）は断片URIとして組み立てるが、XPS→PDF変換で失われる場合があるため
+                // 実際にジャンプするかは書き出し後にPDFビューアでの確認が必要。
+                var linkSwaps = new List<(InlineCollection Parent, Run OriginalRun, Hyperlink Wrapper)>();
+                foreach (var run in FindAllLinkRuns(m_editor.Document).ToList())
+                {
+                    InlineCollection parentInlines = run.Parent switch
+                    {
+                        Paragraph parentPara => parentPara.Inlines,
+                        Span parentSpan => parentSpan.Inlines,
+                        _ => null
+                    };
+                    if (null == parentInlines)
+                    {
+                        continue;
+                    }
+                    var info = (LinkInfo)run.Tag;
+                    Uri navigateUri = BuildPdfNavigateUri(info.Url);
+                    if (null == navigateUri)
+                    {
+                        continue;
+                    }
+                    var hyperlink = new Hyperlink { NavigateUri = navigateUri };
+                    parentInlines.InsertBefore(run, hyperlink);
+                    parentInlines.Remove(run);
+                    hyperlink.Inlines.Add(run);
+                    linkSwaps.Add((parentInlines, run, hyperlink));
+                }
+
+                // ページの上下左右の余白は、メニュー「ファイル」→「PDFの余白を設定…」で設定した
+                // 値（m_pdfMarginTop/Bottom/Left/Right。既定は上下64px、左右80px）をそのまま使う。
+                var margin = new Thickness(m_pdfMarginLeft, m_pdfMarginTop, m_pdfMarginRight, m_pdfMarginBottom);
+
+                // 余白を差し引いた、実際に本文が使える幅（画像のサイズ調整・ColumnWidthの両方で
+                // 同じ値を使い、整合を取る）。
+                double contentWidth = Math.Max(100, dlg.PrintableAreaWidth - m_pdfMarginLeft - m_pdfMarginRight - 8);
+
+                // 画像を、この幅に収まるよう一時的に縮小する（画面上ではエディタの表示幅を基準に
+                // サイズ調整されているため、この幅がそれより狭い場合、そのままではページから
+                // はみ出して欠けてしまうことがある）。書き出し後、画面表示用のサイズに戻す。
+                var originalImageSizes = new Dictionary<Image, (double Width, double Height)>();
+                foreach (var img in m_imageManager.FindAllImages(m_editor.Document))
+                {
+                    originalImageSizes[img] = (img.Width, img.Height);
+                    if (img.Width > contentWidth)
+                    {
+                        double scale = contentWidth / img.Width;
+                        img.Width = contentWidth;
+                        img.Height *= scale;
+                    }
+                }
+
+                // 表（「列幅を補正する」オン時。未調整・調整済みのどちらも）の列幅も、画像と
+                // 同じ理由で一時的に再計算する。列幅は通常エディタの表示幅を基準に確定するため
+                // （BlockStyles.ApplyAutoCalculatedColumnWidths／ApplyExplicitColumnWidths）、
+                // 編集画面がPDF印刷可能幅（contentWidth）より広い環境では表の右端が見切れる
+                // 不具合があった。ウインドウリサイズ時と同じ再計算処理（BlockStyles.
+                // RefreshAutoCalculatedColumnWidths）を画面幅の代わりにcontentWidthで呼び、
+                // 印刷ページ幅に収まる列幅に揃える。調整済みの表も、比率での幅が固定幅（Pixel）
+                // で収まらなければStar比率になるため対象に含めている。書き出し後、画面表示用の
+                // 幅に戻す。
+                var originalTableColumnWidths = new Dictionary<Table, GridLength[]>();
+                if (m_correctColumnWidthsFlg)
+                {
+                    foreach (var table in m_tableEditor.FindAllTables(m_editor.Document))
+                    {
+                        originalTableColumnWidths[table] = table.Columns.Select(c => c.Width).ToArray();
+                        BlockStyles.RefreshAutoCalculatedColumnWidths(table, contentWidth);
+                    }
+                }
+
+                // 表の罫線は、書き出す間だけ少し濃い灰色・同じ太さ（BlockStyles.PRINT_TABLE_BORDER_THICKNESS）に
+                // そろえる（画面用の線のままだと、PDFで一部消えたり、一部だけ太く見えたりするため。
+                // 詳細は BlockStyles.ApplyPrintTableBorders）。書き出し後に画面用の線へ戻す。
+                var tableBorderRestores = new List<Action>();
+                foreach (var table in m_tableEditor.FindAllTables(m_editor.Document))
+                {
+                    tableBorderRestores.Add(BlockStyles.ApplyPrintTableBorders(table));
+                }
+
+                // FlowDocumentは、既定では印刷可能幅に応じて自動的に段組み（複数列）にしてしまう
+                // ことがある。ColumnWidthを「余白を差し引いた実際の本文の幅」に合わせておくことで、
+                // 画面表示と同じ単一列のレイアウトのまま印刷されるようにする。
+                double originalColumnWidth = m_editor.Document.ColumnWidth;
+                m_editor.Document.ColumnWidth = contentWidth;
+
+                try
+                {
+                    // FlowDocument.PagePaddingはこのRichTextBoxのpaginatorでは反映されないため、
+                    // 余白は各ページの描画内容をmarginだけずらして描画するMarginDocumentPaginator
+                    // （下記）で実現する。
+                    var innerPaginator = ((IDocumentPaginatorSource)m_editor.Document).DocumentPaginator;
+                    var pageSize = new Size(dlg.PrintableAreaWidth, dlg.PrintableAreaHeight);
+                    var marginPaginator = new MarginDocumentPaginator(innerPaginator, pageSize, margin);
+
+                    // 編集中のMarkdownファイル名から拡張子を除いたものを、書き出すPDFの既定の
+                    // ファイル名にする（例：「README.md」→「README.pdf」）。
+                    string docName = !string.IsNullOrEmpty(m_currentFilePath)
+                        ? Path.GetFileNameWithoutExtension(m_currentFilePath) : "無題";
+
+                    // 「Microsoft Print to PDF」の保存先ダイアログは、印刷ジョブの説明文字列や
+                    // XPSのTitleなどアプリ側の値を既定ファイル名に使わない仕様（Microsoft自身が
+                    // 非対応と回答している既知の制限）。次善の策として、ファイル名を先に
+                    // クリップボードへコピーしておき、保存ダイアログでCtrl+V貼り付けができるようにする。
+                    try
+                    {
+                        Clipboard.SetText(docName + ".pdf");
+                    }
+                    catch
+                    {
+                        // クリップボードにコピーできなくても、PDFの書き出し自体には支障がないため無視する
+                    }
+
+                    dlg.PrintDocument(marginPaginator, docName);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("書き出しに失敗しました: " + ex.Message, "PDFに書き出し",
+                        MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+                finally
+                {
+                    m_editor.Document.ColumnWidth = originalColumnWidth;
+                    foreach (var restore in tableBorderRestores)
+                    {
+                        restore();
+                    }
+                    foreach (var kv in originalImageSizes)
+                    {
+                        kv.Key.Width = kv.Value.Width;
+                        kv.Key.Height = kv.Value.Height;
+                    }
+                    foreach (var kv in originalTableColumnWidths)
+                    {
+                        var cols = kv.Key.Columns;
+                        for (int c = 0; c < cols.Count && c < kv.Value.Length; c++)
+                        {
+                            cols[c].Width = kv.Value[c];
+                        }
+                    }
+                    foreach (var swap in linkSwaps)
+                    {
+                        swap.Wrapper.Inlines.Remove(swap.OriginalRun);
+                        swap.Parent.InsertBefore(swap.Wrapper, swap.OriginalRun);
+                        swap.Parent.Remove(swap.Wrapper);
+                    }
+                }
+            });
+        }
+
+        /// <summary>文書内から、LinkInfoタグの付いたRun（mde独自のリンク表現）をすべて集める。</summary>
+        /// <param name="a_doc">対象の文書。</param>
+        /// <returns>見つかったリンクのRun一覧。</returns>
+        private IEnumerable<Run> FindAllLinkRuns(FlowDocument a_doc)
+        {
+            foreach (Block block in a_doc.Blocks)
+            {
+                foreach (var run in FindAllLinkRunsInBlock(block))
+                {
+                    yield return run;
+                }
+            }
+        }
+
+        private IEnumerable<Run> FindAllLinkRunsInBlock(Block a_block)
+        {
+            if (a_block is Paragraph p)
+            {
+                foreach (var run in FindAllLinkRunsInInlines(p.Inlines))
+                {
+                    yield return run;
+                }
+            }
+            else if (a_block is Table table)
+            {
+                foreach (TableRowGroup rg in table.RowGroups)
+                {
+                    foreach (TableRow row in rg.Rows)
+                    {
+                        foreach (TableCell cell in row.Cells)
+                        {
+                            foreach (Block b in cell.Blocks)
+                            {
+                                foreach (var run in FindAllLinkRunsInBlock(b))
+                                {
+                                    yield return run;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else if (a_block is List list)
+            {
+                foreach (ListItem li in list.ListItems)
+                {
+                    foreach (Block b in li.Blocks)
+                    {
+                        foreach (var run in FindAllLinkRunsInBlock(b))
+                        {
+                            yield return run;
+                        }
+                    }
+                }
+            }
+        }
+
+        private IEnumerable<Run> FindAllLinkRunsInInlines(InlineCollection a_inlines)
+        {
+            foreach (Inline inline in a_inlines)
+            {
+                if (inline is Run run && run.Tag is LinkInfo)
+                {
+                    yield return run;
+                }
+                else if (inline is Span span)
+                {
+                    foreach (var nestedRun in FindAllLinkRunsInInlines(span.Inlines))
+                    {
+                        yield return nestedRun;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// リンクのURLから、PDF書き出し用のHyperlink.NavigateUriを組み立てる。外部URL
+        /// （http://等）はそのまま使う。同一文書内の見出しへのアンカーリンク（#で始まる
+        /// もの）は「#アンカー名」の断片URIとして組み立てる。それ以外（他ファイルを開く
+        /// リンクなど）は、PDF内では意味を持たないため対象外とする。
+        /// </summary>
+        /// <param name="a_url">リンクの元のURL。</param>
+        /// <returns>組み立てたURI。対象外の場合はnull。</returns>
+        private Uri BuildPdfNavigateUri(string a_url)
+        {
+            if (string.IsNullOrWhiteSpace(a_url))
+            {
+                return null;
+            }
+            if (Regex.IsMatch(a_url, "^[a-zA-Z][a-zA-Z0-9+.-]*:") && !Regex.IsMatch(a_url, "^[a-zA-Z]:[\\\\/]"))
+            {
+                return Uri.TryCreate(a_url, UriKind.Absolute, out Uri external) ? external : null;
+            }
+            if (a_url.StartsWith("#"))
+            {
+                return Uri.TryCreate(a_url, UriKind.Relative, out Uri anchor) ? anchor : null;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 内部のDocumentPaginatorをラップし、各ページの描画内容を指定した余白分だけずらして
+        /// 描画する。FlowDocument.PagePaddingがこのRichTextBoxのpaginator経由では反映されない
+        /// ため、各ページのVisualをTranslateTransformで直接ずらす方式にしている。
+        /// </summary>
+        private class MarginDocumentPaginator : DocumentPaginator
+        {
+            private readonly DocumentPaginator m_inner;
+            private readonly Size m_pageSize;
+            private readonly Thickness m_margin;
+
+            /// <summary>
+            /// ラッパーを作成する。内部のpaginatorには、余白を差し引いた「実際に使える幅・
+            /// 高さ」をページサイズとして与えておき、その中に収まるようレイアウト・改ページを
+            /// 行わせる。
+            /// </summary>
+            /// <param name="a_inner">元のpaginator。</param>
+            /// <param name="a_pageSize">用紙全体のサイズ（余白を含む）。</param>
+            /// <param name="a_margin">上下左右の余白。</param>
+            public MarginDocumentPaginator(DocumentPaginator a_inner, Size a_pageSize, Thickness a_margin)
+            {
+                m_inner = a_inner;
+                m_pageSize = a_pageSize;
+                m_margin = a_margin;
+                m_inner.PageSize = new Size(
+                    Math.Max(1, a_pageSize.Width - a_margin.Left - a_margin.Right),
+                    Math.Max(1, a_pageSize.Height - a_margin.Top - a_margin.Bottom));
+            }
+
+            public override DocumentPage GetPage(int a_pageNumber)
+            {
+                DocumentPage innerPage = m_inner.GetPage(a_pageNumber);
+                var visual = new ContainerVisual { Transform = new TranslateTransform(m_margin.Left, m_margin.Top) };
+                visual.Children.Add(innerPage.Visual);
+                var pageBounds = new Rect(new Point(0, 0), m_pageSize);
+                var contentBounds = new Rect(new Point(m_margin.Left, m_margin.Top), innerPage.Size);
+                return new DocumentPage(visual, m_pageSize, pageBounds, contentBounds);
+            }
+
+            public override bool IsPageCountValid => m_inner.IsPageCountValid;
+            public override int PageCount => m_inner.PageCount;
+            public override Size PageSize
+            {
+                get => m_pageSize;
+                set { /* 用紙全体のサイズは固定。内部paginator用のサイズはコンストラクタで設定済み */ }
+            }
+            // Sourceがm_innerのFlowDocumentを指したままだと、印刷の仕組みがGetPage()の出力を
+            // 使わず元のFlowDocumentから直接ページを作り直す「近道」をすることがあり、余白が
+            // 反映されない。nullを返すことでこれを防ぎ、必ずGetPage()の出力を使わせる。
+            public override IDocumentPaginatorSource Source => null;
+        }
+
+        /// <summary>現在のファイルと、保留中の編集があるすべてのファイルを保存する
+        /// （詳細はFileOperationsManager.SaveAllBtnClick参照）。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void SaveAllBtnClick(object a_sender, RoutedEventArgs a_args) => m_fileOperationsManager.SaveAllBtnClick(a_sender, a_args);
+
+        /// <summary>エディタを空の無題文書にリセットする（詳細はFileOperationsManager.
+        /// DiscardCurrentDocumentSilently参照）。FolderTreeManagerのコンストラクタへdelegateとして
+        /// 渡しているため、このラッパーは維持している。</summary>
+        private void DiscardCurrentDocumentSilently() => m_fileOperationsManager.DiscardCurrentDocumentSilently();
+
+        // ======================================================================
+        //  ズーム（実体はZoomManagerへ移動。XAMLのClick=／PreviewMouseWheel=が
+        //  コードビハインドの同名メソッドを直接参照するため、薄いラッパーとして残す）
+        // ======================================================================
+
+        private void ZoomInClick(object a_sender, RoutedEventArgs a_args) => m_zoomManager.ZoomInClick(a_sender, a_args);
+        private void ZoomOutClick(object a_sender, RoutedEventArgs a_args) => m_zoomManager.ZoomOutClick(a_sender, a_args);
+        private void ZoomResetClick(object a_sender, RoutedEventArgs a_args) => m_zoomManager.ZoomResetClick(a_sender, a_args);
+
+        /// <summary>Ctrl+ホイールでエディタをズームする（スクロールの代わり。詳細はZoomManager.
+        /// EditorPreviewMouseWheel参照）。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void EditorPreviewMouseWheel(object a_sender, MouseWheelEventArgs a_args)
+        {
+            // Ctrl+ホイールは拡大・縮小（ZoomManager）。それ以外はスクロール（ScrollByWheelDelta）
+            m_zoomManager.EditorPreviewMouseWheel(a_sender, a_args);
+            if (!a_args.Handled)
+            {
+                ScrollByWheelDelta(m_editor, a_args);
+            }
+        }
+
+        /// <summary>表示倍率を変える（引数の処理を実行する）時に、編集ペインの一番上に見えている行が動かないようにする
+        /// （ZoomManager.ZoomChangeWrapper）。倍率を変えると、文字の大きさに合わせて折り返しの位置・画像の大きさも変わる
+        /// ため、スクロール量をそのまま保つと別の場所が表示されてしまう。そこで、変える前に一番上に見えている行を覚えておき、
+        /// 変えた後にその行が同じ位置に来るようスクロールし直す（ソースモードでは、一番上に見えている行が一番上に来るようにする）。</summary>
+        /// <param name="a_changeZoom">倍率を変える処理。</param>
+        private void ChangeZoomKeepingTopLine(Action a_changeZoom)
+        {
+            object anchor = m_isSourceModeFlg ? CaptureEditorScrollAnchor() : CaptureZoomTopLineAnchor();
+            a_changeZoom();
+            ApplyDocumentWidth();
+            UpdateLayout();
+            if (anchor is ZoomTopLineAnchor lineAnchor)
+            {
+                RestoreZoomTopLineAnchor(lineAnchor);
+            }
+            else
+            {
+                RestoreEditorScrollAnchor(anchor);
+            }
+        }
+
+        /// <summary>拡大・縮小した時に、今の表示倍率をウィンドウの中央に大きく表示する（m_zoomToast。1秒ほど表示したら
+        /// 消える。続けて拡大・縮小した時は、表示し直してまた1秒ほど表示する）。</summary>
+        /// <param name="a_zoomLevel">今の倍率（1.0が100%）。</param>
+        private void ShowZoomToast(double a_zoomLevel)
+        {
+            m_zoomToastText.Text = Math.Round(a_zoomLevel * 100) + "%";
+            // すぐに表示し、1秒表示したら 0.25 秒かけて消す（アニメーションを始め直すと、前のアニメーションは置き換わる）
+            var fade = new System.Windows.Media.Animation.DoubleAnimationUsingKeyFrames();
+            fade.KeyFrames.Add(new System.Windows.Media.Animation.DiscreteDoubleKeyFrame(1, System.Windows.Media.Animation.KeyTime.FromTimeSpan(TimeSpan.Zero)));
+            fade.KeyFrames.Add(new System.Windows.Media.Animation.DiscreteDoubleKeyFrame(1, System.Windows.Media.Animation.KeyTime.FromTimeSpan(TimeSpan.FromSeconds(1))));
+            fade.KeyFrames.Add(new System.Windows.Media.Animation.LinearDoubleKeyFrame(0, System.Windows.Media.Animation.KeyTime.FromTimeSpan(TimeSpan.FromSeconds(1.25))));
+            m_zoomToast.BeginAnimation(UIElement.OpacityProperty, fade);
+        }
+
+        /// <summary>ChangeZoomKeepingTopLine が覚えておく、Markdownモード時の一番上に見えている行。</summary>
+        private class ZoomTopLineAnchor
+        {
+            /// <summary>一番上に見えている行の中の文字の位置。</summary>
+            public TextPointer Position { get; set; }
+
+            /// <summary>その行の、表示領域の上端より上にスクロールされている割合（0=行の上端が表示領域の上端にある）。
+            /// 行の高さに対する割合で覚えておくのは、画像の行は倍率を変えると画像の大きさ（エディタの座標での）が
+            /// 変わるため。</summary>
+            public double Fraction { get; set; }
+
+            /// <summary>行の上端が表示領域の上端より下に見えていた場合（文書の先頭の余白や、段落と段落の間の余白が上端に
+            /// ある時）の、上端から行の上端までの距離（エディタの座標。px）。null なら、行の途中が上端にあった（Fraction を使う）。</summary>
+            public double? TopGap { get; set; }
+        }
+
+        /// <summary>表示倍率を変える直前に、編集ペインの一番上に見えている行を覚えておく（ChangeZoomKeepingTopLine）。</summary>
+        /// <returns>ZoomTopLineAnchor。行が分からない時（画像の途中等）は、段落単位の位置（CaptureEditorScrollAnchor）。</returns>
+        private object CaptureZoomTopLineAnchor()
+        {
+            if (!m_editor.IsLoaded)
+            {
+                return null;
+            }
+            // 表示領域の上端（GetCharacterRect の座標。m_editor の Padding の上の分だけ下）の、横の真ん中にある文字
+            double viewportTop = m_editor.Padding.Top;
+            TextPointer position = m_editor.GetPositionFromPoint(new Point(m_editor.ActualWidth / 2, viewportTop + 1), true);
+            if (null != position)
+            {
+                // GetCharacterRect の高さはその文字の行の高さ
+                Rect rect = position.GetCharacterRect(LogicalDirection.Forward);
+                // 一番上の行（上端にかかっているか、上端のすぐ下にある行）の文字であることを確かめる（近い文字に吸着した
+                // 結果、上端より上の文字や、ずっと下の文字になることがあるため）
+                if (!rect.IsEmpty && 0 < rect.Height &&
+                    viewportTop <= rect.Bottom && rect.Top - viewportTop < m_editor.ActualHeight / 2)
+                {
+                    return new ZoomTopLineAnchor
+                    {
+                        Position = position,
+                        Fraction = Clamp01((viewportTop - rect.Top) / rect.Height),
+                        TopGap = rect.Top >= viewportTop ? rect.Top - viewportTop : (double?)null,
+                    };
+                }
+            }
+            return CaptureEditorScrollAnchor();
+        }
+
+        /// <summary>CaptureZoomTopLineAnchor で覚えておいた行が、表示倍率を変えた後も同じ位置に来るようスクロールする。
+        /// 呼び出し側で、倍率を変えた後に UpdateLayout() を挟んでから呼び出すこと。</summary>
+        /// <param name="a_anchor">CaptureZoomTopLineAnchor の戻り値。</param>
+        private void RestoreZoomTopLineAnchor(ZoomTopLineAnchor a_anchor)
+        {
+            if (null == m_editorScrollViewer)
+            {
+                m_editorScrollViewer = FindVisualChild<ScrollViewer>(m_editor);
+            }
+            if (null == m_editorScrollViewer)
+            {
+                return;
+            }
+            Rect rect = a_anchor.Position.GetCharacterRect(LogicalDirection.Forward);
+            if (rect.IsEmpty)
+            {
+                return;
+            }
+            double viewportTop = m_editor.Padding.Top;
+            // GetCharacterRect は今の表示領域を基準にした位置のため、行が同じ位置に来るまでのずれを、今のスクロール位置に足す
+            double targetTop = null != a_anchor.TopGap
+                ? rect.Top - viewportTop - a_anchor.TopGap.Value
+                : rect.Top - viewportTop + a_anchor.Fraction * rect.Height;
+            m_editorScrollViewer.ScrollToVerticalOffset(m_editorScrollViewer.VerticalOffset + targetTop);
+        }
+
+        /// <summary>表示の設定を変えて文書を作り直す時（SetVsCodeStyleFlg 等）に覚えておく、一番上に見えている場所。作り直すと
+        /// TextPointer は使えなくなるため、文書の最上位のブロックの番号と、そのブロックの中のどこ（高さに対する割合）が
+        /// 表示領域の上端にあったかで覚える（同じ Markdown から作り直すので、ブロックの並びは変わらない）。</summary>
+        private class RebuildScrollAnchor
+        {
+            /// <summary>表示領域の上端にあった、文書の最上位のブロックの番号（0から）。</summary>
+            public int BlockIndex { get; set; }
+
+            /// <summary>そのブロックの上端から表示領域の上端までの、ブロックの高さに対する割合（0〜1）。</summary>
+            public double Fraction { get; set; }
+
+            /// <summary>ブロックの上端が表示領域の上端より下にあった時（文書の先頭の余白が見えている時等）の、その距離（px）。
+            /// それ以外は 0。</summary>
+            public double TopGap { get; set; }
+        }
+
+        /// <summary>文書の最上位のブロックの上端の位置（表示領域の上端を 0 とした、エディタの座標。px）。ブロックの最初の文字の
+        /// 位置で測る（表・リストは最初のセル・項目の文字）。測れない時は null。</summary>
+        /// <param name="a_block">対象のブロック。</param>
+        /// <returns>上端の位置。</returns>
+        private double? BlockTop(Block a_block)
+        {
+            // 画像で始まる段落：文字の位置（GetCharacterRect）は画像の高さの分ずれた値になるため、画像そのものの位置で測る
+            // （画像の前に、書式の区切りのゼロ幅スペース等の空の文字があってもよい）
+            if (a_block is Paragraph para)
+            {
+                foreach (Inline inline in para.Inlines)
+                {
+                    if (inline is InlineUIContainer container && container.Child is UIElement child && child.IsVisible)
+                    {
+                        return child.TranslatePoint(new Point(0, 0), m_editor).Y - m_editor.Padding.Top;
+                    }
+                    if (!(inline is Run run) || 0 < run.Text.Replace("\u200B", "").Trim().Length)
+                    {
+                        break;
+                    }
+                }
+            }
+            TextPointer start = a_block.ContentStart.GetInsertionPosition(LogicalDirection.Forward);
+            Rect rect = start.GetCharacterRect(LogicalDirection.Forward);
+            if (rect.IsEmpty)
+            {
+                return null;
+            }
+            return rect.Top - m_editor.Padding.Top;
+        }
+
+        /// <summary>ブロックの上端の位置（BlockTop）と、次のブロックの上端までの高さ。</summary>
+        /// <param name="a_blocks">文書の最上位のブロックの並び。</param>
+        /// <param name="a_index">対象のブロックの番号。</param>
+        /// <param name="a_top">上端の位置。</param>
+        /// <param name="a_height">高さ（最後のブロック・測れない時は 0）。</param>
+        /// <returns>上端を測れたか。</returns>
+        private bool TryGetBlockTopAndHeight(List<Block> a_blocks, int a_index, out double a_top, out double a_height)
+        {
+            a_top = 0;
+            a_height = 0;
+            double? top = BlockTop(a_blocks[a_index]);
+            if (null == top)
+            {
+                return false;
+            }
+            a_top = top.Value;
+            double? next = a_index + 1 < a_blocks.Count ? BlockTop(a_blocks[a_index + 1]) : null;
+            if (null != next && next.Value > a_top)
+            {
+                a_height = next.Value - a_top;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 表示の設定（表示スタイル・表示フォント・段落中の改行・列幅の補正・箇条書きの記号）を変えて文書を作り直す前に、
+        /// 編集ペインの一番上に見えている場所を覚えておく（RestoreRebuildScrollAnchor で、作り直した後も同じ場所を表示する。
+        /// 以前は、作り直すと文書の先頭に戻っていた。mdew・mdee は、表示スタイルを変えても同じ場所を表示する）。
+        /// 表示領域の上端にかかっているブロックを、ブロックの上端の位置で二分探索して見つける（文書が長くても速いように）。
+        /// </summary>
+        /// <returns>覚えた位置。ソースモードの時・覚えられない時は null。</returns>
+        private RebuildScrollAnchor CaptureRebuildScrollAnchor()
+        {
+            if (m_isSourceModeFlg || !m_editor.IsLoaded)
+            {
+                return null;
+            }
+            var blocks = m_editor.Document.Blocks.ToList();
+            if (0 == blocks.Count)
+            {
+                return null;
+            }
+            // 上端が表示領域の上端（0）以下にある、最後のブロックを探す（測れないブロックは、前のブロックの続きとみなす）
+            int low = 0;
+            int high = blocks.Count - 1;
+            int found = 0;
+            while (low <= high)
+            {
+                int mid = (low + high) / 2;
+                double? top = BlockTop(blocks[mid]);
+                if (null == top || top.Value <= 0)
+                {
+                    found = mid;
+                    low = mid + 1;
+                }
+                else
+                {
+                    high = mid - 1;
+                }
+            }
+            if (!TryGetBlockTopAndHeight(blocks, found, out double blockTop, out double height))
+            {
+                return null;
+            }
+            var anchor = new RebuildScrollAnchor
+            {
+                BlockIndex = found,
+                Fraction = 0 < height && blockTop < 0 ? Clamp01(-blockTop / height) : 0,
+                TopGap = blockTop > 0 ? blockTop : 0,
+            };
+            if (DebugLogger.IsEnabled)
+            {
+                DebugLogger.Log($"CaptureRebuildScrollAnchor: BlockIndex={found} Block={blocks[found].GetType().Name} Tag={blocks[found].Tag} " +
+                    $"Top={blockTop} Height={height} Fraction={anchor.Fraction} TopGap={anchor.TopGap}");
+            }
+            return anchor;
+        }
+
+        /// <summary>表示の設定を変えて文書を作り直した時（同じ Markdown から作り直すだけで、内容は変わらない）、作り直す前に
+        /// 変更が無かった文書は、変更なしのままにする（以前は、表示スタイル等を切り替えただけで「変更されています」になり、
+        /// 閉じる時に保存するか聞かれていた）。</summary>
+        /// <param name="a_wasDirtyFlg">作り直す前に、変更があったか。</param>
+        private void KeepCleanAfterRebuild(bool a_wasDirtyFlg)
+        {
+            if (!a_wasDirtyFlg && m_currentFileIsDirtyFlg)
+            {
+                m_currentFileIsDirtyFlg = false;
+                m_folderTreeManager.RefreshDirtyMarkers();
+            }
+        }
+
+        /// <summary>CaptureRebuildScrollAnchor で覚えた場所が、文書を作り直した後も一番上に来るようスクロールする。画像は、
+        /// 作り直した後に読み込みが終わってから大きさが決まる（ImageManager.ApplyImageSizingConsideringTable）ため、その分だけ
+        /// 表示がずれることがある。画面の更新が落ち着いた後に、もう一度合わせる。</summary>
+        /// <param name="a_anchor">CaptureRebuildScrollAnchor の戻り値（null なら何もしない）。</param>
+        private void RestoreRebuildScrollAnchor(RebuildScrollAnchor a_anchor)
+        {
+            if (null == a_anchor)
+            {
+                return;
+            }
+            bool caretPlacedFlg = false;
+            void Restore()
+            {
+                if (null == m_editorScrollViewer)
+                {
+                    m_editorScrollViewer = FindVisualChild<ScrollViewer>(m_editor);
+                }
+                var blocks = m_editor.Document.Blocks.ToList();
+                if (null == m_editorScrollViewer || 0 == blocks.Count)
+                {
+                    return;
+                }
+                int index = Math.Min(a_anchor.BlockIndex, blocks.Count - 1);
+                if (!caretPlacedFlg)
+                {
+                    // キャレットを、表示する場所のブロックの先頭に置く（文書の先頭に置いたままだと、後でキャレットが見える
+                    // 位置まで（文書の先頭まで）スクロールされてしまうため）
+                    caretPlacedFlg = true;
+                    m_editor.CaretPosition = blocks[index].ContentStart.GetInsertionPosition(LogicalDirection.Forward);
+                }
+                if (!TryGetBlockTopAndHeight(blocks, index, out double blockTop, out double height))
+                {
+                    return;
+                }
+                double delta = blockTop + a_anchor.Fraction * height - a_anchor.TopGap;
+                if (DebugLogger.IsEnabled)
+                {
+                    DebugLogger.Log($"RestoreRebuildScrollAnchor: BlockIndex={index} Block={blocks[index].GetType().Name} " +
+                        $"Top={blockTop} Height={height} Delta={delta} VerticalOffset={m_editorScrollViewer.VerticalOffset}");
+                }
+                m_editorScrollViewer.ScrollToVerticalOffset(m_editorScrollViewer.VerticalOffset + delta);
+            }
+            UpdateLayout();
+            Restore();
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                UpdateLayout();
+                Restore();
+            }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+        }
+
+        /// <summary>ソースモードのエディタでのマウスホイール・タッチパッドのスクロール（ScrollByWheelDelta）。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void SourceEditorPreviewMouseWheel(object a_sender, MouseWheelEventArgs a_args) => ScrollByWheelDelta(m_sourceEditor, a_args);
+
+        /// <summary>
+        /// マウスホイール・タッチパッドでのスクロールを、回した量（MouseWheelEventArgs.Delta）に比例した量にする。
+        /// WPF の ScrollViewer は、回した量によらず、1回の通知ごとに決まった量（3行＝48px。Windows の「一度に
+        /// スクロールする行数」×16px）スクロールする。マウスのホイールは1目盛りで1回（Delta=120）通知されるので
+        /// 問題ないが、ノートパソコンのタッチパッドは、指を少し動かすたびに小さな量（Delta が 120 より小さい値）で
+        /// 何回も通知するため、その回数分 48px ずつスクロールして、スクロールしすぎてしまう（mdew（WebView2）は
+        /// 量に比例してスクロールするので、ちょうどよい量になる）。マウスのホイール1目盛りの量は今までと同じ。
+        /// </summary>
+        /// <param name="a_editor">スクロールするエディタ（RichTextBox または TextBox）。</param>
+        /// <param name="a_args">イベントの引数（スクロールしたら Handled にする）。</param>
+        private void ScrollByWheelDelta(Control a_editor, MouseWheelEventArgs a_args)
+        {
+            if (ModifierKeys.None != Keyboard.Modifiers)
+            {
+                return;
+            }
+            var scrollViewer = FindVisualChild<ScrollViewer>(a_editor);
+            if (null == scrollViewer)
+            {
+                return;
+            }
+            int lines = SystemParameters.WheelScrollLines;
+            // 「一度に1画面スクロールする」設定（-1）の時は、1目盛りで1画面分
+            double amountPerNotch = 0 < lines ? lines * 16.0 : scrollViewer.ViewportHeight;
+            scrollViewer.ScrollToVerticalOffset(scrollViewer.VerticalOffset - a_args.Delta / 120.0 * amountPerNotch);
+            a_args.Handled = true;
+        }
+
+        /// <summary>ソースモード編集中、ファイルをダーティにする。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void SourceEditorTextChanged(object a_sender, TextChangedEventArgs a_args)
+        {
+            if (null == m_folderTreeManager)
+            {
+                return; // InitializeComponent中の発火に対するガード
+            }
+            m_currentFileIsDirtyFlg = true;
+            m_folderTreeManager.RefreshDirtyMarkers();
+        }
+
+        /// <summary>エディタの幅が変わったら、画像のサイズ調整と、未調整（自動計算）の表の
+        /// 列幅の再計算をやり直す。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void EditorSizeChanged(object a_sender, SizeChangedEventArgs a_args)
+        {
+            if (null == m_imageManager)
+            {
+                return; // InitializeComponent中の発火に対するガード
+            }
+            if (m_isSourceModeFlg)
+            {
+                return;
+            }
+            // 本文の幅（「読みやすい幅にする」の時の左右の余白）を、先に今の幅に合わせる（画像・表の幅は、この余白を
+            // 除いた幅に合わせるため）
+            ApplyDocumentWidth();
+            RefreshImageAndTableWidths();
+        }
+
+        /// <summary>画像の大きさと、表の列幅を、今の本文の幅に合わせ直す（EditorSizeChanged・SetLimitDocWidthFlg）。</summary>
+        private void RefreshImageAndTableWidths()
+        {
+            // 表のセル内の画像はApplyImageSizingConsideringTable経由で列幅を考慮したサイズにする
+            // （表の外の画像は従来通りエディタ幅基準）。単純にApplyImageSizing（エディタ幅基準）
+            // だけを呼ぶと、セル内の画像は列幅を無視した（広すぎる）サイズになってしまう。
+            // 画像を含む段落の行の高さの固定を外す処理（BlockStyles.ApplyImageParagraphLineHeight）が
+            // 初めて実際に段落のプロパティを変える場合もTextChangedを発生させるため、リサイズだけで
+            // ファイルがダーティ扱いにならないよう、RunWithoutDirtyMarkingでラップする。
+            RunWithoutDirtyMarking(() =>
+            {
+                foreach (var img in m_imageManager.FindAllImages(m_editor.Document))
+                {
+                    m_imageManager.ApplyImageSizingConsideringTable(img);
+                }
+            });
+            // 列幅の変更はRichTextBox.TextChangedを発生させるため（ChromiumPdfExporter呼び出し側の
+            // 既存コメント参照）、ウインドウのリサイズだけでファイルがダーティ扱いになってしまわない
+            // よう、RunWithoutDirtyMarkingでラップする。
+            RunWithoutDirtyMarking(() => m_tableEditor.RefreshAutoCalculatedColumnWidthsForResize());
+        }
+
+        // ======================================================================
+        //  ドラッグ&ドロップでの画像挿入（ImageManagerへそのまま橋渡し）
+        // ======================================================================
+
+        private void EditorDragEnter(object a_sender, DragEventArgs a_args) => m_imageManager.HandleDragEnter(a_sender, a_args);
+        private void EditorDragOver(object a_sender, DragEventArgs a_args) => m_imageManager.HandleDragOver(a_sender, a_args);
+        private void EditorDrop(object a_sender, DragEventArgs a_args) => m_imageManager.HandleDrop(a_sender, a_args);
+
+        // ======================================================================
+        //  検索と置換（ウィンドウを開く処理の実体はFindReplaceLauncherへ移動。以下の
+        //  公開プロパティは、FindReplaceWindow.xaml.cs側がMainWindowを直接参照して
+        //  使うAPIのため、引き続きここに残す）
+        // ======================================================================
+
+        /// <summary>検索・置換の公開API。FindReplaceWindowから使う。</summary>
+        public SearchReplaceService SearchReplace => m_searchReplaceService;
+
+        /// <summary>現在開いているファイルの絶対パス（未保存なら null）。FindReplaceWindowが
+        /// 「今開いているファイルから検索を始める」ために参照する。</summary>
+        public string CurrentFilePath => m_currentFilePath;
+
+        /// <summary>アウトラインペインの管理役。検索結果の反映などにFindReplaceWindowから使う。</summary>
+        public OutlineManager OutlinePane => m_outlineManager;
+
+        /// <summary>フォルダツリーペインの管理役。検索結果の反映などにFindReplaceWindowから使う。</summary>
+        public FolderTreeManager FolderTreePane => m_folderTreeManager;
+
+        private void FindReplaceBtnClick(object a_sender, RoutedEventArgs a_args)
+        {
+            m_findReplaceLauncher.Open(SelectedTextForFind());
+        }
+
+        /// <summary>検索と置換ウィンドウを開く時に、検索する文字列に入れる文字列（編集ペイン・ソースモードの入力欄で
+        /// 範囲選択している文字列。mdew と同じ）。選択していない時・複数行にまたがる時は ""（検索する文字列の欄は
+        /// 1行のため。欄は前回の内容のままになる）。書式の区切りに使っている見えない文字（ゼロ幅スペース）は除く。</summary>
+        /// <returns>検索する文字列に入れる文字列。</returns>
+        private string SelectedTextForFind()
+        {
+            string text = m_isSourceModeFlg
+                ? m_sourceEditor.SelectedText
+                : (m_editor.Selection.IsEmpty ? "" : m_editor.Selection.Text);
+            text = BlockStyles.StripUrlBreakJoiners((text ?? "").Replace("\u200B", ""));
+            return text.IndexOfAny(new[] { '\r', '\n' }) >= 0 ? "" : text;
+        }
+
+        /// <summary>メインウインドウのキーボードショートカットの実装。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void MainWindowPreviewKeyDown(object a_sender, KeyEventArgs a_args)
+        {
+            if (a_args.Key == Key.F &&
+                Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                a_args.Handled = true;
+                m_findReplaceLauncher.Open(SelectedTextForFind());
+            }
+            // 表示倍率（mdew と同じ）：Ctrl++（日本語キーボードの Ctrl+; も。Shift の有無は問わない）・Ctrl+-・Ctrl+0
+            // （テンキーも）。Ctrl+= 等は RichTextBox の下付き・上付き文字の切り替えに割り当てられているが、mde では使わない。
+            else if ((a_args.Key == Key.OemPlus || a_args.Key == Key.Add) &&
+                     (Keyboard.Modifiers == ModifierKeys.Control || Keyboard.Modifiers == (ModifierKeys.Control | ModifierKeys.Shift)))
+            {
+                a_args.Handled = true;
+                m_zoomManager.ZoomInClick(a_sender, null);
+            }
+            else if ((a_args.Key == Key.OemMinus || a_args.Key == Key.Subtract) &&
+                     Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                a_args.Handled = true;
+                m_zoomManager.ZoomOutClick(a_sender, null);
+            }
+            else if ((a_args.Key == Key.D0 || a_args.Key == Key.NumPad0) &&
+                     Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                a_args.Handled = true;
+                m_zoomManager.ZoomResetClick(a_sender, null);
+            }
+            // Ctrl+N（Shift+Ctrl+N も）は「新規作成」（新しいウィンドウを開く。mdew と同じ）。
+            else if (a_args.Key == Key.N &&
+                     (Keyboard.Modifiers == ModifierKeys.Control || Keyboard.Modifiers == (ModifierKeys.Control | ModifierKeys.Shift)))
+            {
+                a_args.Handled = true;
+                NewBtnClick(a_sender, null);
+            }
+            // Ctrl+Oは「開く」のショートカットとして扱う。
+            else if (a_args.Key == Key.O &&
+                     Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                a_args.Handled = true;
+                OpenBtnClick(a_sender, null);
+            }
+            // Ctrl+Sは「保存」のショートカットとして扱う（Windows標準のCtrl+Sは「すべて保存」なので、そちらは無効化する）。
+            else if (a_args.Key == Key.S &&
+                     Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                a_args.Handled = true;
+                SaveBtnClick(a_sender, null);
+            }
+            // Shift+Ctrl+Sは「名前を付けて保存...」のショートカットとして扱う。
+            else if (a_args.Key == Key.S &&
+                     Keyboard.Modifiers == (ModifierKeys.Control | ModifierKeys.Shift))
+            {
+                a_args.Handled = true;
+                SaveAs();
+            }
+            // Ctrl+Pは「PDFに書き出し」のショートカットとして扱う（Windows標準のCtrl+Pは「印刷」なので、そちらは無効化する）。
+            else if (a_args.Key == Key.P &&
+                     Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                a_args.Handled = true;
+                ExportPdfBtnClick(a_sender, null);
+            }
+            // Ctrl+Wは「ウィンドウを閉じる」のショートカットとして扱う。
+            else if (a_args.Key == Key.W &&
+                     Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                a_args.Handled = true;
+                Close();
+            }
+            // Ctrl+Zは「元に戻す」のショートカットとして扱う（ソースモードでは、TextBox標準の
+            // Undoにそのまま任せる）。
+            else if (a_args.Key == Key.Z &&
+                     Keyboard.Modifiers == ModifierKeys.Control &&
+                     !m_isSourceModeFlg)
+            {
+                a_args.Handled = true;
+                if (m_editor.CanUndo)
+                {
+                    // 見出し・引用・コードブロックの意味情報（Tag）も、HeadingCodeBlockEditor が TextChanged で戻す
+                    m_editor.Undo();
+                }
+            }
+            // Ctrl+Yは「やり直し」のショートカットとして扱う（ソースモードでは、TextBox標準の
+            // Redoにそのまま任せる）。
+            else if (a_args.Key == Key.Y &&
+                     Keyboard.Modifiers == ModifierKeys.Control &&
+                     !m_isSourceModeFlg)
+            {
+                a_args.Handled = true;
+                if (m_editor.CanRedo)
+                {
+                    m_editor.Redo();
+                }
+            }
+            // Ctrl+左カーソルキーは「1つ前に開いていたファイルを開く」のショートカットとして扱う。
+            else if (a_args.Key == Key.Left &&
+                     Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                a_args.Handled = true;
+                m_fileOperationsManager.NavigateFileHistoryBack();
+            }
+            // Ctrl+右カーソルキーは「1つ後に開いていたファイルを開く」のショートカットとして扱う。
+            else if (a_args.Key == Key.Right &&
+                     Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                a_args.Handled = true;
+                m_fileOperationsManager.NavigateFileHistoryForward();
+            }
+        }
+
+        /// <summary>メニュー「ヘルプ」→「Readmeを開く」。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void OpenReadmeBtnClick(object a_sender, RoutedEventArgs a_args)
+        {
+            OpenReadme();
+        }
+
+        /// <summary>ビルド時に実行フォルダへコピーされるREADME.mdを、新しいウインドウで開く
+        /// （現在表示中のファイルの内容には触れない）。README.mdの読み込み自体は、新しく開いた
+        /// ウインドウへ、通常の「ファイルを開く」と同じ経路（LoadFile）で行う。メニュー
+        /// 「ヘルプ」→「Readmeを開く」のほか、F1キーのグローバルショートカット
+        /// （App.xaml.csのGlobalPreviewKeyDown参照）からも、このウインドウに対して
+        /// 呼び出される。</summary>
+        public void OpenReadme()
+        {
+            string readmePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "README.md");
+            if (!File.Exists(readmePath))
+            {
+                MessageBox.Show("README.mdが見つかりませんでした：" + readmePath, "Readmeを開く",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            var readmeWindow = new MainWindow(this);
+            readmeWindow.Show();
+            readmeWindow.LoadFile(readmePath);
+        }
+
+        /// <summary>「バージョン情報」ボタン。アプリ名とバージョン番号を表示する。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void VersionInfoBtnClick(object a_sender, RoutedEventArgs a_args)
+        {
+            var aboutWindow = new AboutWindow { Owner = this };
+            aboutWindow.ShowDialog();
+        }
+
+        /// <summary>メニュー「ファイル」→「PDFの余白を設定…」。ダイアログを開き、PDF書き出し時の
+        /// 上下左右の余白（px）を設定する。OKで確定した値を記憶し、次回起動時にも復元される
+        /// （実際にPDFへ反映されるのは、次に「PDFに書き出し」を実行した時点）。</summary>
+        /// <param name="a_sender">「PDFの余白を設定…」メニュー項目。</param>
+        /// <param name="a_args">Click event.</param>
+        private void PdfMarginBtnClick(object a_sender, RoutedEventArgs a_args)
+        {
+            var dialog = new PdfMarginDialog(m_pdfMarginTop, m_pdfMarginBottom, m_pdfMarginLeft, m_pdfMarginRight)
+                { Owner = this };
+            if (true == dialog.ShowDialog())
+            {
+                m_pdfMarginTop = dialog.MarginTop;
+                m_pdfMarginBottom = dialog.MarginBottom;
+                m_pdfMarginLeft = dialog.MarginLeft;
+                m_pdfMarginRight = dialog.MarginRight;
+            }
+        }
+
+        /// <summary>メニュー「表示」→「リンクの開き方」→「Ctrl+クリックで開く」。</summary>
+        /// <param name="a_sender">メニュー項目。</param>
+        /// <param name="a_args">Click event.</param>
+        private void LinkModeCtrlClickChecked(object a_sender, RoutedEventArgs a_args)
+        {
+            m_requireCtrlForLinkClickFlg = true;
+            UpdateLinkModeMenuChecks();
+        }
+
+        /// <summary>メニュー「表示」→「リンクの開き方」→「クリックのみで開く」。</summary>
+        /// <param name="a_sender">メニュー項目。</param>
+        /// <param name="a_args">Click event.</param>
+        private void LinkModeClickOnlyChecked(object a_sender, RoutedEventArgs a_args)
+        {
+            m_requireCtrlForLinkClickFlg = false;
+            UpdateLinkModeMenuChecks();
+        }
+
+        /// <summary>「リンクの開き方」メニューの2項目を、現在の設定に合わせてラジオボタンのように
+        /// 片方だけチェック状態にする。</summary>
+        private void UpdateLinkModeMenuChecks()
+        {
+            m_linkModeCtrlClickMenuItem.IsChecked = m_requireCtrlForLinkClickFlg;
+            m_linkModeClickOnlyMenuItem.IsChecked = !m_requireCtrlForLinkClickFlg;
+        }
+
+        /// <summary>メニュー「表示」→「デバッグログを有効にする」。</summary>
+        /// <param name="a_sender">メニュー項目。</param>
+        /// <param name="a_args">Click event.</param>
+        private void DebugLogMenuItemChecked(object a_sender, RoutedEventArgs a_args)
+        {
+            DebugLogger.SetEnabled(m_debugLogMenuItem.IsChecked);
+        }
+
+        /// <summary>メニュー「表示」→「段落中の改行」→「ソースの通りに改行する」（mde/Typora
+        /// 従来の表示。既定値）。</summary>
+        /// <param name="a_sender">メニュー項目。</param>
+        /// <param name="a_args">Click event.</param>
+        private void LineBreakModeSourceChecked(object a_sender, RoutedEventArgs a_args)
+        {
+            SetPreserveSourceLineBreaksFlg(true);
+        }
+
+        /// <summary>メニュー「表示」→「段落中の改行」→「空行が入るまで改行しない」
+        /// （CommonMark/VSCodeのMarkdownプレビュー標準の表示）。</summary>
+        /// <param name="a_sender">メニュー項目。</param>
+        /// <param name="a_args">Click event.</param>
+        private void LineBreakModeBlankOnlyChecked(object a_sender, RoutedEventArgs a_args)
+        {
+            SetPreserveSourceLineBreaksFlg(false);
+        }
+
+        /// <summary>段落中の改行の扱いの設定を変更する。Markdownモードで文書を表示中であれば、
+        /// 現在の内容を一旦Markdownテキストへ書き出してから読み直すことで、新しい設定を
+        /// その場で反映させる（LoadFile等、文書を丸ごと差し替える他の処理と同じパターン）。
+        /// 文書再構築直後のキャレット位置は不定・不確実になりうるため、LoadFile等の既存箇所に
+        /// ならい、独自のキャレット位置の保持・復元は試みず、いったん文書の先頭へ明示的に設定した上で、
+        /// 一番上に見えていたブロックの先頭へ置き直す（表示している場所を保つため。RestoreRebuildScrollAnchor）。ソースモード中は、次にMarkdownモードへ切り替え
+        /// られた際の変換に反映されるよう、設定値を変更するだけにとどめる。</summary>
+        /// <param name="a_value">true＝ソースの通りに改行する、false＝空行が入るまで改行しない。</param>
+        private void SetPreserveSourceLineBreaksFlg(bool a_value)
+        {
+            if (m_preserveSourceLineBreaksFlg != a_value)
+            {
+                if (m_isSourceModeFlg)
+                {
+                    m_preserveSourceLineBreaksFlg = a_value;
+                }
+                else
+                {
+                    string md = m_markdownConverter.DocumentToMarkdown(m_editor.Document);
+                    m_preserveSourceLineBreaksFlg = a_value;
+                    RebuildScrollAnchor scrollAnchor = CaptureRebuildScrollAnchor();
+                    bool wasDirtyFlg = m_currentFileIsDirtyFlg;
+                    RunAsProgrammaticChange(() => m_markdownConverter.MarkdownToDocument(md, m_editor.Document));
+                    m_outlineManager.Refresh();
+                    m_editor.CaretPosition = m_editor.Document.ContentStart;
+                    RestoreRebuildScrollAnchor(scrollAnchor);
+                    KeepCleanAfterRebuild(wasDirtyFlg);
+                }
+            }
+            UpdateLineBreakModeMenuChecks();
+        }
+
+        /// <summary>「段落中の改行」メニューの2項目を、現在の設定に合わせてラジオボタンのように
+        /// 片方だけチェック状態にする。</summary>
+        private void UpdateLineBreakModeMenuChecks()
+        {
+            m_lineBreakModeSourceMenuItem.IsChecked = m_preserveSourceLineBreaksFlg;
+            m_lineBreakModeBlankOnlyMenuItem.IsChecked = !m_preserveSourceLineBreaksFlg;
+        }
+
+        /// <summary>メニュー「表示」→「箇条書きの記号」→「WPF標準」（1段目Disc・2段目Circle・
+        /// 3段目以降Box。既定値）。</summary>
+        /// <param name="a_sender">メニュー項目。</param>
+        /// <param name="a_args">Click event.</param>
+        private void MarkerStyleWpfStandardChecked(object a_sender, RoutedEventArgs a_args)
+        {
+            SetUniformMarkerStyleFlg(false);
+        }
+
+        /// <summary>メニュー「表示」→「箇条書きの記号」→「すべての階層に同じ記号を使用する」
+        /// （段数によらず常にDiscにする）。</summary>
+        /// <param name="a_sender">メニュー項目。</param>
+        /// <param name="a_args">Click event.</param>
+        private void MarkerStyleUniformChecked(object a_sender, RoutedEventArgs a_args)
+        {
+            SetUniformMarkerStyleFlg(true);
+        }
+
+        /// <summary>箇条書きの記号の割り当て方式を変更する。SetPreserveSourceLineBreaksFlgと
+        /// 同じ理由・同じ方法（現在の文書をいったんMarkdownへ変換し、
+        /// フラグを切り替えた上で再度解析し直す）で、開いている文書全体に即座に反映する
+        /// （既存の箇条書きは、作成時に決まったMarkerStyleをそのまま持ち続けており、設定を
+        /// 変えただけでは自動的には追従しないため）。</summary>
+        /// <param name="a_value">true＝段数によらずすべての階層で同じ記号（Disc）を使う、
+        /// false（既定）＝WPF標準の割り当て（1段目Disc・2段目Circle・3段目以降Box）。</param>
+        private void SetUniformMarkerStyleFlg(bool a_value)
+        {
+            if (m_uniformMarkerStyleFlg != a_value)
+            {
+                if (m_isSourceModeFlg)
+                {
+                    m_uniformMarkerStyleFlg = a_value;
+                }
+                else
+                {
+                    string md = m_markdownConverter.DocumentToMarkdown(m_editor.Document);
+                    m_uniformMarkerStyleFlg = a_value;
+                    RebuildScrollAnchor scrollAnchor = CaptureRebuildScrollAnchor();
+                    bool wasDirtyFlg = m_currentFileIsDirtyFlg;
+                    RunAsProgrammaticChange(() => m_markdownConverter.MarkdownToDocument(md, m_editor.Document));
+                    m_outlineManager.Refresh();
+                    m_editor.CaretPosition = m_editor.Document.ContentStart;
+                    RestoreRebuildScrollAnchor(scrollAnchor);
+                    KeepCleanAfterRebuild(wasDirtyFlg);
+                }
+            }
+            UpdateMarkerStyleMenuChecks();
+        }
+
+        /// <summary>「箇条書きの記号」メニューの2項目を、現在の設定に合わせてラジオボタンのように
+        /// 片方だけチェック状態にする。</summary>
+        private void UpdateMarkerStyleMenuChecks()
+        {
+            m_markerStyleWpfStandardMenuItem.IsChecked = !m_uniformMarkerStyleFlg;
+            m_markerStyleUniformMenuItem.IsChecked = m_uniformMarkerStyleFlg;
+        }
+
+        /// <summary>エディタの表示フォントを、指定した設定へ反映する。DynamicResource
+        /// "EditorFontFamily"（MainWindow.xamlのWindow.Resources参照）を更新することで、
+        /// m_editorDocument（FlowDocument）・m_sourceEditor（TextBox）双方のFontFamilyへ、
+        /// WPFの通常のプロパティ継承・DynamicResourceの仕組みで即座に反映される
+        /// （行の間隔の EditorLineHeight 等と同じ DynamicResource の仕組み）。表のセル幅計測用フォント
+        /// （BlockStyles.SetTableMeasureFontFamily）も合わせて更新する（既存の表の列幅は、文書を作り直した時に更新される。
+        /// 表示スタイルの切り替え（SetVsCodeStyleFlg）は文書を作り直す）。</summary>
+        /// <param name="a_useLegacyFontFlg">true＝以前のフォント、false＝既定の新しいフォント。</param>
+        private void ApplyEditorFontFamily(bool a_useLegacyFontFlg)
+        {
+            // VSCodeスタイルの時は「表示フォント」の設定によらず VSCodeスタイルのフォントを使う
+            // （「表示フォント」メニューは使えなくなる。ApplyDocStyle参照）。
+            var fontFamily = BlockStyles.VsCodeStyleFlg
+                ? BlockStyles.VsCodeEditorFontFamily
+                : a_useLegacyFontFlg
+                ? BlockStyles.LegacyEditorFontFamily
+                : BlockStyles.DefaultEditorFontFamily;
+            Resources["EditorFontFamily"] = fontFamily;
+            BlockStyles.SetTableMeasureFontFamily(fontFamily);
+        }
+
+        /// <summary>メニュー「表示」→「文字の色」→「くっきりした色」。</summary>
+        /// <param name="a_sender">メニュー項目。</param>
+        /// <param name="a_args">Click event.</param>
+        private void TextColorSharpChecked(object a_sender, RoutedEventArgs a_args)
+        {
+            m_softTextColorFlg = false;
+            ApplyTextColor(false);
+            UpdateTextColorMenuChecks();
+        }
+
+        /// <summary>メニュー「表示」→「文字の色」→「目にやさしい色」。</summary>
+        /// <param name="a_sender">メニュー項目。</param>
+        /// <param name="a_args">Click event.</param>
+        private void TextColorSoftChecked(object a_sender, RoutedEventArgs a_args)
+        {
+            m_softTextColorFlg = true;
+            ApplyTextColor(true);
+            UpdateTextColorMenuChecks();
+        }
+
+        /// <summary>「文字の色」メニューの2項目を、現在の設定に合わせてラジオボタンのように片方だけチェック状態にする。</summary>
+        private void UpdateTextColorMenuChecks()
+        {
+            m_textColorSharpMenuItem.IsChecked = !m_softTextColorFlg;
+            m_textColorSoftMenuItem.IsChecked = m_softTextColorFlg;
+        }
+
+        /// <summary>エディタの文字の色を、指定した設定へ反映する。「くっきりした色」は本文・ソースモードとも黒、
+        /// リンクは #0969DA（今までどおり）。「目にやさしい色」は本文・ソースモードとも少し薄い灰色（#333333）、
+        /// リンクも少し薄い青（#4183C4）。本文の文字は RichTextBox の Foreground を継承しているので、ここを変えると
+        /// 即座に変わる。リンクは、すべてのリンクで共有しているブラシ（MarkdownConverter.LinkBrush）の色を変える。
+        /// 引用の文字（灰色）・メニュー等の画面の部品の文字は変えない。VSCodeスタイルの時のリンクは、文字の色の
+        /// 設定によらず #006AB1（mdew と同じ）。</summary>
+        /// <param name="a_softFlg">true＝目にやさしい色、false＝くっきりした色。</param>
+        private void ApplyTextColor(bool a_softFlg)
+        {
+            var textBrush = new SolidColorBrush(a_softFlg ? Color.FromRgb(0x33, 0x33, 0x33) : Colors.Black);
+            textBrush.Freeze();
+            m_editor.Foreground = textBrush;
+            m_sourceEditor.Foreground = textBrush;
+            // メニュー（メニューバーのメニュー・右クリックのメニュー）の文字の色も合わせる（mdew と同じ。MenuStyles.xaml の
+            // MenuText）。右クリックのメニューはウィンドウの外に開くため、メニュー自身にも設定する。
+            var menuTextBrush = new SolidColorBrush(a_softFlg ? Color.FromRgb(0x33, 0x33, 0x33) : Color.FromRgb(0x1C, 0x1C, 0x1C));
+            menuTextBrush.Freeze();
+            Resources["MenuText"] = menuTextBrush;
+            m_editorContextMenu.Resources["MenuText"] = menuTextBrush;
+            m_sourceEditorContextMenu.Resources["MenuText"] = menuTextBrush;
+            MarkdownConverter.LinkBrush.Color = BlockStyles.VsCodeStyleFlg
+                ? Color.FromRgb(0x00, 0x6A, 0xB1)
+                : a_softFlg ? Color.FromRgb(0x41, 0x83, 0xC4) : Color.FromRgb(0x09, 0x69, 0xDA);
+        }
+
+        /// <summary>メニュー「表示」→「表示スタイル」→「GitHubスタイル」。</summary>
+        /// <param name="a_sender">メニュー項目。</param>
+        /// <param name="a_args">Click event.</param>
+        private void DocStyleGithubChecked(object a_sender, RoutedEventArgs a_args)
+        {
+            SetVsCodeStyleFlg(false);
+        }
+
+        /// <summary>メニュー「表示」→「表示スタイル」→「VSCodeスタイル」。</summary>
+        /// <param name="a_sender">メニュー項目。</param>
+        /// <param name="a_args">Click event.</param>
+        private void DocStyleVsCodeChecked(object a_sender, RoutedEventArgs a_args)
+        {
+            SetVsCodeStyleFlg(true);
+        }
+
+        /// <summary>表示スタイルを切り替える。見出し・コードブロック・表等の見た目は段落やRunを作る時に
+        /// 決まる（BlockStyles.VsCodeStyleFlg 参照）ため、段落中の改行の切り替え（SetPreserveSourceLineBreaksFlg）と
+        /// 同じ方法で、現在の文書をいったんMarkdownへ変換し、スタイルを切り替えた上で解析し直す。</summary>
+        /// <param name="a_value">true＝VSCodeスタイル、false＝GitHubスタイル。</param>
+        private void SetVsCodeStyleFlg(bool a_value)
+        {
+            if (m_vsCodeStyleFlg != a_value)
+            {
+                if (m_isSourceModeFlg)
+                {
+                    // ソースモードの時は、Markdownモードへ戻る時に新しいスタイルで文書が作られる。
+                    m_vsCodeStyleFlg = a_value;
+                    ApplyDocStyle();
+                }
+                else
+                {
+                    string md = m_markdownConverter.DocumentToMarkdown(m_editor.Document);
+                    m_vsCodeStyleFlg = a_value;
+                    ApplyDocStyle();
+                    RebuildScrollAnchor scrollAnchor = CaptureRebuildScrollAnchor();
+                    bool wasDirtyFlg = m_currentFileIsDirtyFlg;
+                    RunAsProgrammaticChange(() => m_markdownConverter.MarkdownToDocument(md, m_editor.Document));
+                    m_outlineManager.Refresh();
+                    m_editor.CaretPosition = m_editor.Document.ContentStart;
+                    RestoreRebuildScrollAnchor(scrollAnchor);
+                    KeepCleanAfterRebuild(wasDirtyFlg);
+                }
+                // ソースモードの文字の大きさ（本文と同じ）も表示倍率を掛けて付け直す。
+                m_zoomManager.ApplyCurrentZoomLevel();
+            }
+            UpdateDocStyleMenuChecks();
+        }
+
+        /// <summary>罫線（見出しの下の線・表の罫線など、1px の線）は、行の位置が画面のピクセルの境目にかかると、なめらかに描く
+        /// 処理で2ピクセルにまたがって薄く描かれる（mdew・mdee の線より薄く・太く見える）。線や枠をピクセルに合わせてくっきり
+        /// 描く（文字の描き方は変わらない）。以前は GitHubスタイルの見出しの下線に 1px 未満の太さを使っていて、くっきり描くと
+        /// 消えることがあったため VSCodeスタイルの時だけにしていたが、1px にしたため、どちらのスタイルでもくっきり描く。くっきり描く設定は、その要素の中のすべてに効き、中の一部だけ元に戻すことはできないため、
+        /// エディタ全体（スクロールバーを含む）ではなく、文書を表示する部分（スクロール領域の ScrollContentPresenter。
+        /// スクロールバーはその外にある）だけに付ける（スクロールバーの矢印・つまみの角が、ギザギザにならないように）。</summary>
+        private void ApplyEditorEdgeMode()
+        {
+            var presenter = FindVisualChild<ScrollContentPresenter>(m_editor);
+            if (null != presenter)
+            {
+                RenderOptions.SetEdgeMode(presenter, EdgeMode.Aliased);
+            }
+        }
+
+        /// <summary>
+        /// 編集ペインの文書の上の余白（px）。mdew と同じく、ファイルの先頭に余白（24px）を空け、さらに文書の先頭の段落の
+        /// 上の余白（見出しなら BlockStyles.ApplyHeadingStyle で付けた上の余白）を足す。mdew（HTML）は先頭の見出しの上の余白もそのまま
+        /// 空けるが、WPF は文書の先頭の段落の上の余白を無視するため、その分をここで足している。倍率
+        /// （EDITOR_FIRST_BLOCK_MARGIN_RATIO）は、以前は mdew の見出しの上の余白が mde より大きい分を補うため 1.25 に
+        /// していたが、今の mdew・mdee は文書の先頭のまとまりの上の余白を 0 にする（app.css の「#doc &gt; :first-child」）ため、
+        /// 0（文書の上の余白は 24px だけ）にした（見出しの大きさ・余白も mdew・mdee と同じ。BlockStyles.ApplyHeadingStyle）。
+        /// </summary>
+        private double EditorTopPadding
+        {
+            get
+            {
+                Block firstBlock = m_editorDocument.Blocks.FirstBlock;
+                double firstMargin = null != firstBlock && !double.IsNaN(firstBlock.Margin.Top) ? firstBlock.Margin.Top : 0;
+                return EDITOR_TOP_PADDING + Math.Round(firstMargin * EDITOR_FIRST_BLOCK_MARGIN_RATIO);
+            }
+        }
+
+        /// <summary>編集ペインの文書の上下の余白（FlowDocument.PagePadding の上・下）を EditorTopPadding・
+        /// EDITOR_BOTTOM_PADDING にする（既にそうなら何もしない。コンストラクタ参照）。</summary>
+        private void ApplyEditorTopPadding()
+        {
+            Thickness pagePadding = m_editorDocument.PagePadding;
+            double top = EditorTopPadding;
+            if (top == pagePadding.Top &&
+                EDITOR_BOTTOM_PADDING == pagePadding.Bottom)
+            {
+                return;
+            }
+            DebugLogger.Log($"ApplyEditorTopPadding: PagePadding={pagePadding} → Top={top} Bottom={EDITOR_BOTTOM_PADDING}");
+            m_editorDocument.PagePadding = new Thickness(pagePadding.Left, top, pagePadding.Right, EDITOR_BOTTOM_PADDING);
+        }
+
+        /// <summary>メニュー「表示」を開いた時：フォルダ・アウトラインの表示、ソースモードの ✓ と、表示倍率の見出し・
+        /// 拡大／縮小／100%に戻すの選べる・選べないを、今の状態に合わせる（ステータスバーのボタンや Ctrl+マウスホイール
+        /// でも変わるため、開くたびに合わせる。mdew と同じ）。</summary>
+        /// <param name="a_sender">メニュー「表示」。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void ViewMenuSubmenuOpened(object a_sender, RoutedEventArgs a_args)
+        {
+            if (!ReferenceEquals(a_sender, a_args.OriginalSource))
+            {
+                return;
+            }
+            m_viewFolderPaneMenuItem.IsChecked = m_folderPaneVisibleFlg;
+            m_viewOutlinePaneMenuItem.IsChecked = m_outlinePaneVisibleFlg;
+            m_viewStatusBarMenuItem.IsChecked = m_statusBarVisibleFlg;
+            m_viewSourceModeMenuItem.IsChecked = m_isSourceModeFlg;
+            double zoomLevel = m_zoomManager.ZoomLevel;
+            m_viewZoomHeadingMenuItem.Header = "表示倍率：" + Math.Round(zoomLevel * 100) + "%";
+            m_viewZoomInMenuItem.IsEnabled = zoomLevel < ZoomManager.MAX_ZOOM_LEVEL;
+            m_viewZoomOutMenuItem.IsEnabled = zoomLevel > ZoomManager.MIN_ZOOM_LEVEL;
+            m_viewZoomResetMenuItem.IsEnabled = 1.0 != zoomLevel;
+        }
+
+        /// <summary>メニュー「表示」→「ステータスバーを表示」：ステータスバーの表示・非表示を切り替える（mdew と同じ。
+        /// 次回起動時も同じにする）。非表示の間も、ペインの表示・ソースモード・表示倍率はメニュー「表示」で切り替えられる。</summary>
+        /// <param name="a_sender">メニュー項目。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void ToggleStatusBarClick(object a_sender, RoutedEventArgs a_args)
+        {
+            m_statusBarVisibleFlg = !m_statusBarVisibleFlg;
+            m_statusBar.Visibility = m_statusBarVisibleFlg ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        /// <summary>「表示スタイル」メニューの2項目を、現在の設定に合わせてラジオボタンのように片方だけチェック状態にする。</summary>
+        private void UpdateDocWidthMenuChecks()
+        {
+            m_docWidthLimitedMenuItem.IsChecked = m_limitDocWidthFlg;
+            m_docWidthFullMenuItem.IsChecked = !m_limitDocWidthFlg;
+        }
+
+        /// <summary>メニュー「表示」→「本文の幅」→「読みやすい幅にする（最大 884px）」。</summary>
+        /// <param name="a_sender">メニュー項目。</param>
+        /// <param name="a_args">Click event.</param>
+        private void DocWidthLimitedChecked(object a_sender, RoutedEventArgs a_args)
+        {
+            SetLimitDocWidthFlg(true);
+        }
+
+        /// <summary>メニュー「表示」→「本文の幅」→「編集ペインの幅に合わせる」。</summary>
+        /// <param name="a_sender">メニュー項目。</param>
+        /// <param name="a_args">Click event.</param>
+        private void DocWidthFullChecked(object a_sender, RoutedEventArgs a_args)
+        {
+            SetLimitDocWidthFlg(false);
+        }
+
+        /// <summary>本文の幅を切り替える。折り返しの位置が変わっても、編集ペインの一番上に見えている行が動かないように
+        /// する（表示倍率を変える時と同じ。ChangeZoomKeepingTopLine）。画像・表の幅は、編集ペインの幅が変わった時と同じく
+        /// 合わせ直す（EditorSizeChanged）。</summary>
+        /// <param name="a_value">true＝読みやすい幅にする、false＝編集ペインの幅に合わせる。</param>
+        private void SetLimitDocWidthFlg(bool a_value)
+        {
+            if (m_limitDocWidthFlg != a_value)
+            {
+                ChangeZoomKeepingTopLine(() =>
+                {
+                    m_limitDocWidthFlg = a_value;
+                    ApplyDocumentWidth();
+                    if (!m_isSourceModeFlg)
+                    {
+                        UpdateLayout();
+                        RefreshImageAndTableWidths();
+                    }
+                });
+            }
+            UpdateDocWidthMenuChecks();
+        }
+
+        /// <summary>
+        /// 本文の幅を、今の設定（m_limitDocWidthFlg）と編集ペインの幅に合わせる。「読みやすい幅にする」の時は、文字を書く
+        /// 幅が最大 884px（BlockStyles.READABLE_DOCUMENT_WIDTH_PX。表示倍率を掛けた幅）になるよう、編集ペイン（RichTextBox）・
+        /// ソースモードの入力欄の左右の余白（Padding）を広げて、本文を中央に置く（mdew・mdee と同じ。編集ペインが狭い時は、
+        /// 本来の余白のまま）。「編集ペインの幅に合わせる」の時は、本来の余白（MainWindow.xaml の値）に戻す。
+        /// 余白は Padding に付ける（PagePadding の左右は RichTextBox が管理するため。ApplyEditorTopPadding 参照）。
+        /// 画像・表の表示できる幅（ImageManager.GetAvailableImageWidth・TableEditor.GetAvailableTableWidth）は、Padding を
+        /// 除いた幅で計算しているため、そのまま本文の幅に合う。
+        /// </summary>
+        private void ApplyDocumentWidth()
+        {
+            if (null == m_editor || null == m_sourceEditor)
+            {
+                return;
+            }
+            double scrollBarWidth = SystemParameters.VerticalScrollBarWidth;
+            // 編集ペイン：表示倍率は LayoutTransform（ZoomManager.SetZoom）なので、ActualWidth・Padding は倍率を掛ける前の値
+            double extra = 0;
+            if (m_limitDocWidthFlg && 0 < m_editor.ActualWidth)
+            {
+                // 文字を書く幅 = 幅 − 本来の左右の余白 − スクロールバー − 文書の左右の余白（PagePadding）
+                Thickness page = m_editorDocument.PagePadding;
+                double pageSides = (double.IsNaN(page.Left) ? 0 : page.Left) + (double.IsNaN(page.Right) ? 0 : page.Right);
+                double textWidth = m_editor.ActualWidth - m_editorBasePadding.Left - m_editorBasePadding.Right - scrollBarWidth - pageSides;
+                extra = Math.Max(0, Math.Floor((textWidth - BlockStyles.READABLE_DOCUMENT_WIDTH_PX) / 2));
+            }
+            var editorPadding = new Thickness(m_editorBasePadding.Left + extra, m_editorBasePadding.Top,
+                m_editorBasePadding.Right + extra, m_editorBasePadding.Bottom);
+            if (editorPadding != m_editor.Padding)
+            {
+                m_editor.Padding = editorPadding;
+            }
+            // ソースモードの入力欄：表示倍率は文字の大きさなので、884px にも倍率を掛ける
+            double sourceExtra = 0;
+            if (m_limitDocWidthFlg && 0 < m_sourceEditor.ActualWidth)
+            {
+                double zoom = m_zoomManager?.ZoomLevel ?? 1.0;
+                double textWidth = m_sourceEditor.ActualWidth - m_sourceEditorBasePadding.Left - m_sourceEditorBasePadding.Right - scrollBarWidth;
+                sourceExtra = Math.Max(0, Math.Floor((textWidth - BlockStyles.READABLE_DOCUMENT_WIDTH_PX * zoom) / 2));
+            }
+            var sourcePadding = new Thickness(m_sourceEditorBasePadding.Left + sourceExtra, m_sourceEditorBasePadding.Top,
+                m_sourceEditorBasePadding.Right + sourceExtra, m_sourceEditorBasePadding.Bottom);
+            if (sourcePadding != m_sourceEditor.Padding)
+            {
+                m_sourceEditor.Padding = sourcePadding;
+            }
+        }
+
+        private void UpdateDocStyleMenuChecks()
+        {
+            m_docStyleGithubMenuItem.IsChecked = !m_vsCodeStyleFlg;
+            m_docStyleVsCodeMenuItem.IsChecked = m_vsCodeStyleFlg;
+        }
+
+        /// <summary>表示スタイル（m_vsCodeStyleFlg）を、BlockStylesと、行の間隔・余白のDynamicResource
+        /// （MainWindow.xamlのWindow.Resources）・本文の文字の大きさ・表示フォント・リンクの色へ反映する。
+        /// 既に作られている段落の見た目（見出し・コードブロック等）は変わらないため、切り替え時は
+        /// SetVsCodeStyleFlgが文書を作り直す。</summary>
+        private void ApplyDocStyle()
+        {
+            BlockStyles.VsCodeStyleFlg = m_vsCodeStyleFlg;
+            Resources["EditorLineHeight"] = BlockStyles.BodyLineHeight;
+            Resources["EditorListLineHeight"] = BlockStyles.ListLineHeight;
+            Resources["EditorListItemSpacing"] = new Thickness(0, BlockStyles.ListItemSpacing, 0, 0);
+            Resources["EditorBlockSpacing"] = new Thickness(0, 0, 0, BlockStyles.ParagraphBottomSpacing);
+            Resources["EditorListSpacing"] = new Thickness(0, 0, 0, BlockStyles.ListBottomSpacing);
+            Resources["EditorListPadding"] = new Thickness(BlockStyles.ListIndent, 0, 0, 0);
+            Resources["EditorDecimalListPadding"] = new Thickness(BlockStyles.DecimalListIndent, 0, 0, 0);
+            m_editor.FontSize = BlockStyles.BodyFontSize;
+            ApplyEditorFontFamily(m_useLegacyFontFlg);
+            ApplyTextColor(m_softTextColorFlg);
+            // VSCodeスタイルのリンクは、ふだんは下線なしで、マウスを乗せた時だけ下線を表示する（mdew と同じ）
+            m_linkHoverUnderline.Enabled = m_vsCodeStyleFlg;
+            // 文書の線をくっきり描く（ApplyEditorEdgeMode 参照）
+            ApplyEditorEdgeMode();
+        }
+
+        // ======================================================================
+        //  フォルダ / アウトラインペインの表示・非表示切り替え
+        // ======================================================================
+
+        /// <summary>フォルダツリーペインの表示/非表示を切り替える（幅は次に表示する時のために
+        /// 記憶しておく）。切り替えでエディタの表示幅が変わり文章の折り返し位置が変わっても、
+        /// エディタペインの見た目上のスクロール位置が動かないよう、切り替えの前後でスクロール
+        /// 位置を保存・復元する。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void ToggleFolderPaneBtnClick(object a_sender, RoutedEventArgs a_args)
+        {
+            if (m_folderPaneVisibleFlg && m_folderColumnDef.Width.Value > 0)
+            {
+                m_lastFolderColumnWidth = m_folderColumnDef.Width.Value;
+            }
+            m_folderPaneVisibleFlg = !m_folderPaneVisibleFlg;
+
+            object scrollAnchor = CaptureEditorScrollAnchor();
+            ApplyFolderPaneVisibility();
+            UpdateLayout();
+            RestoreEditorScrollAnchor(scrollAnchor);
+        }
+
+        /// <summary>folderPaneVisibleの現在値に従って、フォルダペインの表示状態をXAML側の
+        /// コントロールへ反映する（ボタンクリック時、起動時の状態復元時の両方から呼ばれる）。</summary>
+        private void ApplyFolderPaneVisibility()
+        {
+            if (m_folderPaneVisibleFlg)
+            {
+                m_folderColumnDef.Width = new GridLength(m_lastFolderColumnWidth);
+                m_folderSplitterColumnDef.Width = new GridLength(2);
+                m_folderPaneBorder.Visibility = Visibility.Visible;
+                m_folderSplitter.Visibility = Visibility.Visible;
+                m_toggleFolderPaneBtn.Content = "フォルダを隠す";
+            }
+            else
+            {
+                m_folderColumnDef.Width = new GridLength(0);
+                m_folderSplitterColumnDef.Width = new GridLength(0);
+                m_folderPaneBorder.Visibility = Visibility.Collapsed;
+                m_folderSplitter.Visibility = Visibility.Collapsed;
+                m_toggleFolderPaneBtn.Content = "フォルダを表示";
+            }
+        }
+
+        /// <summary>アウトラインペインの表示/非表示を切り替える（幅は次に表示する時のために
+        /// 記憶しておく）。切り替えでエディタの表示幅が変わり文章の折り返し位置が変わっても、
+        /// エディタペインの見た目上のスクロール位置が動かないよう、切り替えの前後でスクロール
+        /// 位置を保存・復元する。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void ToggleOutlinePaneBtnClick(object a_sender, RoutedEventArgs a_args)
+        {
+            if (m_outlinePaneVisibleFlg && m_outlineColumnDef.Width.Value > 0)
+            {
+                m_lastOutlineColumnWidth = m_outlineColumnDef.Width.Value;
+            }
+            m_outlinePaneVisibleFlg = !m_outlinePaneVisibleFlg;
+
+            object scrollAnchor = CaptureEditorScrollAnchor();
+            ApplyOutlinePaneVisibility();
+            UpdateLayout();
+            RestoreEditorScrollAnchor(scrollAnchor);
+        }
+
+        /// <summary>outlinePaneVisibleの現在値に従って、アウトラインペインの表示状態をXAML側の
+        /// コントロールへ反映する（ボタンクリック時、起動時の状態復元時の両方から呼ばれる）。</summary>
+        private void ApplyOutlinePaneVisibility()
+        {
+            if (m_outlinePaneVisibleFlg)
+            {
+                m_outlineColumnDef.Width = new GridLength(m_lastOutlineColumnWidth);
+                m_outlineSplitterColumnDef.Width = new GridLength(2);
+                m_outlinePaneBorder.Visibility = Visibility.Visible;
+                m_outlineSplitter.Visibility = Visibility.Visible;
+                m_toggleOutlinePaneBtn.Content = "アウトラインを隠す";
+            }
+            else
+            {
+                m_outlineColumnDef.Width = new GridLength(0);
+                m_outlineSplitterColumnDef.Width = new GridLength(0);
+                m_outlinePaneBorder.Visibility = Visibility.Collapsed;
+                m_outlineSplitter.Visibility = Visibility.Collapsed;
+                m_toggleOutlinePaneBtn.Content = "アウトラインを表示";
+            }
+        }
+
+        /// <summary>エディタ内部のScrollViewerへの参照（フォルダ/アウトラインペイン切り替え時の
+        /// スクロール位置保持に使う）。RestoreEditorScrollAnchorで初回使用時に取得する。</summary>
+        private ScrollViewer m_editorScrollViewer;
+
+        /// <summary>ソースモードのエディタ（m_sourceEditor）内部のScrollViewerへの参照。
+        /// ScrollEditorToTopで初回使用時に取得する。</summary>
+        private ScrollViewer m_sourceEditorScrollViewer;
+
+        /// <summary>現在表示中のエディタ（Markdownモードならm_editor、ソースモードなら
+        /// m_sourceEditor）のスクロール位置を、無条件に一番上（左上端）へ戻す。LoadFileで
+        /// 文書・テキストを丸ごと差し替えた直後に呼び出す。
+        ///
+        /// RichTextBox・TextBoxは内容を丸ごと入れ替えても同じ内部ScrollViewerを使い回すため、
+        /// スクロール位置が古いファイルを表示していた時の値のまま残る。CaretPosition/CaretIndex
+        /// を先頭へ設定するだけでは、古いスクロール位置に新しい文書のたまたまある内容
+        /// （プログラムによるキャレット変更は自動スクロールを伴わないため）が表示され続けて
+        /// しまうので、ScrollViewerへ直接オフセット0への移動を指示する。ScrollToLine等の
+        /// 「見えていなければ最小限だけスクロールする」系のメソッドは、新しい文書の先頭付近が
+        /// たまたま既に見えていると何も起こらないため使わない。</summary>
+        private void ScrollEditorToTop()
+        {
+            if (m_isSourceModeFlg)
+            {
+                if (null == m_sourceEditorScrollViewer)
+                {
+                    m_sourceEditorScrollViewer = FindVisualChild<ScrollViewer>(m_sourceEditor);
+                }
+                m_sourceEditorScrollViewer?.ScrollToVerticalOffset(0);
+                m_sourceEditorScrollViewer?.ScrollToHorizontalOffset(0);
+            }
+            else
+            {
+                if (null == m_editorScrollViewer)
+                {
+                    m_editorScrollViewer = FindVisualChild<ScrollViewer>(m_editor);
+                }
+                m_editorScrollViewer?.ScrollToVerticalOffset(0);
+                m_editorScrollViewer?.ScrollToHorizontalOffset(0);
+            }
+        }
+
+        /// <summary>右クリックのメニュー「ページトップに戻る」：文書の先頭を表示し、キャレットも先頭に置く
+        /// （キャレットを置かないと、続けて文字を打った時に元の位置へ戻ってしまうため。mdew と同じ）。
+        /// プログラムによるキャレットの移動は自動スクロールを伴わないため、ScrollEditorToTopで先頭を表示する。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void ScrollToPageTopClick(object a_sender, RoutedEventArgs a_args)
+        {
+            if (m_isSourceModeFlg)
+            {
+                m_sourceEditor.CaretIndex = 0;
+                m_sourceEditor.Focus();
+            }
+            else
+            {
+                m_editor.CaretPosition = m_editor.Document.ContentStart;
+                m_editor.Focus();
+            }
+            ScrollEditorToTop();
+        }
+
+        /// <summary>ファイルパスごとに覚えておく、直前にそのファイルを表示していた時のおおまかな
+        /// スクロール位置（0〜1の割合。Markdownモードなら文書全体の高さに対する縦スクロール量の
+        /// 割合、ソースモードなら一番上に見えている行が全体の行数に対して何割目かを表す）。
+        /// 別のファイルを開いてから、またこのファイルへ戻ってきた時に、大まかに同じ場所を
+        /// 再現するために使う。ピクセル量や行番号そのものではなく割合で覚えておくのは、その間に
+        /// ウインドウ幅の変更や編集で折り返し位置・行数が変わっていても、それなりに近い場所へ
+        /// 戻れるようにするため（正確な位置の完全な復元は狙わない）。</summary>
+        private readonly Dictionary<string, double> m_rememberedScrollFractions =
+            new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>ファイルを切り替える直前に呼び出し、今表示している内容のスクロール位置を、
+        /// 切り替え前のファイル（a_path）に対して覚えておく。LoadFileから、別のファイルへ
+        /// 切り替える場合にのみ呼ばれる（同じファイルを開き直すだけの場合や、初回起動時は
+        /// 呼ばれない）。</summary>
+        /// <param name="a_path">今表示している内容の、切り替え前のファイルパス。</param>
+        private void RememberCurrentScrollPosition(string a_path)
+        {
+            double fraction = 0;
+            if (m_isSourceModeFlg)
+            {
+                if (m_sourceEditor.IsLoaded && m_sourceEditor.LineCount > 0)
+                {
+                    int firstVisibleLine = m_sourceEditor.GetFirstVisibleLineIndex();
+                    if (firstVisibleLine > 0)
+                    {
+                        fraction = Clamp01((double)firstVisibleLine / m_sourceEditor.LineCount);
+                    }
+                }
+            }
+            else if (m_editor.IsLoaded)
+            {
+                if (null == m_editorScrollViewer)
+                {
+                    m_editorScrollViewer = FindVisualChild<ScrollViewer>(m_editor);
+                }
+                if (null != m_editorScrollViewer && m_editorScrollViewer.ExtentHeight > 0)
+                {
+                    fraction = Clamp01(m_editorScrollViewer.VerticalOffset / m_editorScrollViewer.ExtentHeight);
+                }
+            }
+
+            if (fraction > 0)
+            {
+                m_rememberedScrollFractions[a_path] = fraction;
+            }
+            else
+            {
+                // 先頭付近を見ていた場合は、あえて覚えておく必要が無い（覚えている情報が
+                // 無ければ、呼び出し側であるRestoreOrResetScrollPositionが先頭へスクロール
+                // するため、結果は同じになる）。辞書を無駄に肥大化させないために削除しておく。
+                m_rememberedScrollFractions.Remove(a_path);
+            }
+        }
+
+        /// <summary>ファイルを開いた（切り替えた）直後にLoadFileから呼び出す。a_pathについて
+        /// RememberCurrentScrollPositionで覚えているスクロール位置があればそこへ、無ければ
+        /// 文書の先頭へスクロールする。
+        ///
+        /// 新しい文書のレイアウト（高さ・行数）は、文書を差し替えた直後にはまだ確定していない
+        /// ことがある（SelectAndScrollTo等、他の箇所でDispatcherPriority.Loadedまで処理を
+        /// 遅らせている理由と同じ）。そのため、まず即座に先頭へ戻しておき（0を指定するだけ
+        /// なのでレイアウト未確定でも安全）、レイアウトが一段落したタイミングで、覚えている
+        /// 位置があれば改めてそこへスクロールし直す、という2段階の処理にしている。</summary>
+        /// <param name="a_path">これから表示する内容のファイルパス。</param>
+        private void RestoreOrResetScrollPosition(string a_path)
+        {
+            ScrollEditorToTop();
+
+            if (!m_rememberedScrollFractions.TryGetValue(a_path, out double fraction))
+            {
+                return;
+            }
+
+            bool sourceModeAtScheduleTimeFlg = m_isSourceModeFlg;
+            m_editor.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                // 復元を待っている間に表示モード（Markdown/ソース）が切り替わっていた場合は、
+                // 対象が変わってしまっているため何もしない。
+                if (m_isSourceModeFlg != sourceModeAtScheduleTimeFlg)
+                {
+                    return;
+                }
+
+                if (m_isSourceModeFlg)
+                {
+                    if (m_sourceEditor.LineCount > 0)
+                    {
+                        int targetLine = (int)(fraction * m_sourceEditor.LineCount);
+                        // ScrollToLineは「見えていなければ最小限だけスクロールする」仕様のため、
+                        // 既に見えている行だと一番上への移動が起きないことがある（他のスクロール
+                        // 処理と同じ対策で、先に一旦先頭へリセットしてから改めて対象行へ
+                        // スクロールする）。
+                        m_sourceEditor.ScrollToLine(0);
+                        m_sourceEditor.ScrollToLine(targetLine);
+                    }
+                }
+                else
+                {
+                    if (null == m_editorScrollViewer)
+                    {
+                        m_editorScrollViewer = FindVisualChild<ScrollViewer>(m_editor);
+                    }
+                    if (null != m_editorScrollViewer)
+                    {
+                        m_editorScrollViewer.ScrollToVerticalOffset(fraction * m_editorScrollViewer.ExtentHeight);
+                    }
+                }
+            }), System.Windows.Threading.DispatcherPriority.Loaded);
+        }
+
+        /// <summary>CaptureEditorScrollAnchorが覚えておく、Markdownモード時のスクロール位置。
+        /// 「左上端に見えている段落」そのものと、その段落のどのくらいの割合が上端より上に
+        /// スクロールされているか（0=段落の先頭が見えている、1に近いほど段落の末尾近くまで
+        /// スクロール済み）を保持する。ピクセル量ではなく段落に対する割合で覚えておくのは、
+        /// 見出しの図解画像のように1段落がエディタの表示領域よりずっと大きいコンテンツでは、
+        /// ペイン切り替えによる幅変更で画像自体のサイズも変わるため（ImageManager.
+        /// ApplyImageSizing参照）、ピクセル量では復元後に全く違う場所を指してしまうため。</summary>
+        private class EditorScrollAnchor
+        {
+            public Paragraph Paragraph { get; set; }
+            public double VerticalFraction { get; set; }
+            public double HorizontalFraction { get; set; }
+
+            /// <summary>段落の先頭が表示領域の上端より下に見えていた場合（文書の先頭の余白が見えている時や、段落と段落の
+            /// 間の余白が上端にある時）の、上端から段落の先頭までの距離（px）。null なら、段落の途中が上端にあった
+            /// （VerticalFraction を使う）。</summary>
+            public double? TopGap { get; set; }
+        }
+
+        /// <summary>フォルダ/アウトラインペインの表示・非表示を切り替える直前に呼び出し、今
+        /// エディタペインの左上端に見えている位置を覚えておく。ペインの表示・非表示で
+        /// エディタの表示幅が変わると、文章の折り返し位置や画像の縮小率が変わってしまい、
+        /// スクロール量（ピクセル位置）をそのまま維持するだけでは全く違う場所が表示されて
+        /// しまう。そこで、幅変更後にRestoreEditorScrollAnchorで同じ場所へスクロールし直す
+        /// ための情報をここで集めておく。</summary>
+        /// <returns>MarkdownモードならEditorScrollAnchor、ソースモードなら一番上に見えている
+        /// 行の先頭文字インデックス（int）。復元できる情報が無ければnull。</returns>
+        private object CaptureEditorScrollAnchor()
+        {
+            if (m_isSourceModeFlg)
+            {
+                if (!m_sourceEditor.IsLoaded)
+                {
+                    return null;
+                }
+                int firstVisibleLine = m_sourceEditor.GetFirstVisibleLineIndex();
+                if (firstVisibleLine < 0)
+                {
+                    return null;
+                }
+                return m_sourceEditor.GetCharacterIndexFromLineIndex(firstVisibleLine);
+            }
+
+            if (!m_editor.IsLoaded)
+            {
+                return null;
+            }
+
+            TextPointer nearPointer = m_editor.GetPositionFromPoint(new Point(0, 0), true);
+            Paragraph para = nearPointer?.Paragraph;
+            if (null == para)
+            {
+                return null;
+            }
+
+            Rect startRect = para.ContentStart.GetCharacterRect(LogicalDirection.Forward);
+            Rect endRect = para.ContentEnd.GetCharacterRect(LogicalDirection.Backward);
+            double height = endRect.Bottom - startRect.Top;
+            double width = endRect.Right - startRect.Left;
+            // 表示領域の上端（GetCharacterRect の座標。m_editor の Padding の上の分だけ下）
+            double viewportTop = m_editor.Padding.Top;
+            return new EditorScrollAnchor
+            {
+                Paragraph = para,
+                // 段落の先頭が上端より下に見えている時は、その距離をそのまま覚えておき、切り替え後も同じ距離に戻す。
+                // 割合（VerticalFraction）だけだと 0 になり、段落の先頭がぴったり上端に来るまでスクロールしてしまうため、
+                // 文書の先頭を表示している時にアウトライン等を開閉すると、文書の上の余白（FlowDocument.PagePadding）の
+                // 分だけ下にずれていた。
+                TopGap = startRect.Top >= viewportTop ? startRect.Top - viewportTop : (double?)null,
+                // GetPositionFromPointは、その段落が図解画像1枚だけで構成されているような
+                // 場合（＝段落の途中を指す文字位置が存在しない場合）、段落の先頭か末尾の
+                // どちらか近い方へ吸着してしまい、実際にはその画像の途中までスクロールして
+                // いたという情報が失われる。そのため個々の文字位置ではなく、段落全体の
+                // 縦横のRect（先頭〜末尾）を基準に「左上端が段落の何%の位置にあるか」を
+                // 割合として覚えておくことで、画像の途中までスクロールしていた場合にも
+                // 対応できるようにしている。
+                VerticalFraction = (height > 0) ? Clamp01((viewportTop - startRect.Top) / height) : 0,
+                HorizontalFraction = (width > 0) ? Clamp01((0 - startRect.Left) / width) : 0,
+            };
+        }
+
+        /// <summary>0〜1の範囲に収める。</summary>
+        private static double Clamp01(double a_value) => a_value < 0 ? 0 : (a_value > 1 ? 1 : a_value);
+
+        /// <summary>文字インデックス（a_charIndex）が、テキスト（a_text）中の何番目の論理行
+        /// （\nで区切った行。MarkdownConverter.FindBlockIndexForSourceLine等が期待する行番号と
+        /// 同じ数え方）にあるかを返す。
+        ///
+        /// m_sourceEditorはTextWrapping="Wrap"のため、TextBox標準のGetLineIndexFromCharacterIndex
+        /// やGetFirstVisibleLineIndexが返す「行」は、折り返し後の表示上の行であり、Markdown
+        /// ソースの実際の改行で区切った論理行とは一致しない（長い箇条書き等、折り返しで2行以上に
+        /// なる行が手前にあると、その分だけ表示行番号のほうが論理行番号より大きくなる）。
+        /// FindBlockIndexForSourceLineに渡す行番号は論理行番号である必要があるため、文字
+        /// インデックス（折り返しの影響を受けない）から、改行の数を直接数えて求める。</summary>
+        /// <param name="a_text">対象のテキスト全体。</param>
+        /// <param name="a_charIndex">論理行番号を知りたい位置の文字インデックス。</param>
+        /// <returns>0始まりの論理行番号。</returns>
+        private static int GetLogicalLineIndexForCharacterOffset(string a_text, int a_charIndex)
+        {
+            if (string.IsNullOrEmpty(a_text) || a_charIndex <= 0)
+            {
+                return 0;
+            }
+            int clampedIndex = Math.Min(a_charIndex, a_text.Length);
+            string prefix = a_text.Substring(0, clampedIndex).Replace("\r\n", "\n");
+            int lineCount = 0;
+            foreach (char c in prefix)
+            {
+                if ('\n' == c)
+                {
+                    lineCount++;
+                }
+            }
+            return lineCount;
+        }
+
+        /// <summary>CaptureEditorScrollAnchorで覚えておいた位置が、再びエディタペインの左上端に
+        /// 来るようスクロール位置を復元する。ペインの表示・非表示によるレイアウト変更
+        /// （折り返し位置・画像サイズの再計算）が完了した後でないと正しい位置を計算できない
+        /// ため、呼び出し側で幅の変更後にUpdateLayout()を挟んでから呼び出すこと。</summary>
+        /// <param name="a_anchor">CaptureEditorScrollAnchorの戻り値。</param>
+        private void RestoreEditorScrollAnchor(object a_anchor)
+        {
+            if (null == a_anchor)
+            {
+                return;
+            }
+
+            if (m_isSourceModeFlg)
+            {
+                if (a_anchor is int charIndex)
+                {
+                    int newLine = m_sourceEditor.GetLineIndexFromCharacterIndex(charIndex);
+                    if (newLine >= 0)
+                    {
+                        // ScrollToLineは「見えていなければ最小限だけスクロールする」仕様のため、
+                        // 既に見えている行だと一番上への移動が起きないことがある。OutlineManager.
+                        // ScrollParagraphToTopと同じ理由・同じ対策で、先に一旦先頭へスクロール位置を
+                        // リセットしてから改めて対象行へスクロールし、毎回確実に一番上へ来るようにする。
+                        m_sourceEditor.ScrollToLine(0);
+                        m_sourceEditor.ScrollToLine(newLine);
+                    }
+                }
+                return;
+            }
+
+            if (a_anchor is EditorScrollAnchor anchor &&
+                null != anchor.Paragraph?.Parent) // 段落がまだ文書ツリーに残っていることの確認
+            {
+                if (null == m_editorScrollViewer)
+                {
+                    m_editorScrollViewer = FindVisualChild<ScrollViewer>(m_editor);
+                }
+                if (null == m_editorScrollViewer)
+                {
+                    return;
+                }
+
+                // GetCharacterRectは、現在のビューポート（見えている範囲）を基準にした相対座標を
+                // 返す。段落の（レイアウト変更後の、新しいサイズでの）先頭〜末尾のRectを改めて
+                // 取得し、記憶しておいた割合を掛けることで、「左上端にあったのと同じ場所」の
+                // 現在のビューポート内での位置を求める。それに変更前のスクロール位置を足すことで、
+                // 文書全体を基準にした「復元すべきスクロール位置」になる。
+                Rect startRect = anchor.Paragraph.ContentStart.GetCharacterRect(LogicalDirection.Forward);
+                Rect endRect = anchor.Paragraph.ContentEnd.GetCharacterRect(LogicalDirection.Backward);
+                double height = endRect.Bottom - startRect.Top;
+                double width = endRect.Right - startRect.Left;
+                double viewportTop = m_editor.Padding.Top;
+                // 段落の先頭が上端より下に見えていた場合は、同じ距離だけ下に段落の先頭が来るようにする（TopGap 参照）
+                double targetTop = null != anchor.TopGap
+                    ? startRect.Top - viewportTop - anchor.TopGap.Value
+                    : startRect.Top - viewportTop + anchor.VerticalFraction * height;
+                double targetLeft = startRect.Left + anchor.HorizontalFraction * width;
+
+                m_editorScrollViewer.ScrollToVerticalOffset(m_editorScrollViewer.VerticalOffset + targetTop);
+                m_editorScrollViewer.ScrollToHorizontalOffset(m_editorScrollViewer.HorizontalOffset + targetLeft);
+            }
+        }
+
+        // ======================================================================
+        //  フォルダペイン
+        // ======================================================================
+        //
+        // フォルダツリーの読み込み・選択項目のスクロール可視化・横スクロール位置の補正等、
+        // TreeView自体に関わる処理はFolderTreeManagerが担う。ここではXAML側のイベント
+        // バインディング（Click=/Loaded=/SelectedItemChanged=/RequestBringIntoView=）が
+        // 直接MainWindowのインスタンスメソッドを要求するため、そのまま橋渡しする薄い
+        // ラッパーだけを残している。ペインの表示/非表示切り替え（幅の記憶・GridColumn操作）は、
+        // エディタペインのスクロール位置保持処理と密接に絡んでいるため、別区画に残している。
+
+        /// <summary>フォルダビューの「…」ボタン：フォルダを選んで開く。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void OpenFolderTreeBtnClick(object a_sender, RoutedEventArgs a_args) => ChooseAndOpenFolder();
+
+        /// <summary>メニュー「ファイル」→「フォルダを開く…」：フォルダを選んで開く（フォルダビューの
+        /// 「…」ボタンと同じ）。</summary>
+        /// <param name="a_sender">イベントの発生元。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void OpenFolderMenuClick(object a_sender, RoutedEventArgs a_args)
+        {
+            if (!OpensInNewWindow())
+            {
+                ChooseAndOpenFolder();
+                return;
+            }
+            // 今のウィンドウでファイル・フォルダを表示している時は、選んだフォルダを新しいウィンドウで開く
+            // （保存していない変更も今のウィンドウにそのまま残るので、破棄の確認は要らない）
+            var dlg = new Microsoft.Win32.OpenFolderDialog();
+            if (true != dlg.ShowDialog())
+            {
+                return;
+            }
+            OpenFolderFromMenu(dlg.FolderName);
+        }
+
+        /// <summary>メニューからファイル・フォルダを開く時（「開く…」「最近使ったファイル」「フォルダを開く…」
+        /// 「最近使ったフォルダ」・Ctrl+O）に、新しいウィンドウで開くか。今のウィンドウでフォルダ・ファイルを
+        /// 表示している時や、何か書いてある時は、今の内容を残したまま新しいウィンドウで開く（mdew と同じ）。
+        /// 何も書いていない新規のウィンドウなら、このウィンドウで開く。</summary>
+        /// <returns>新しいウィンドウで開くならtrue。</returns>
+        private bool OpensInNewWindow()
+        {
+            if (!string.IsNullOrEmpty(m_folderTreeManager.LoadedFolderRootPath) || !string.IsNullOrEmpty(m_currentFilePath))
+            {
+                return true;
+            }
+            string text = m_isSourceModeFlg ? m_sourceEditor.Text : m_markdownConverter.DocumentToMarkdown(m_editor.Document);
+            return !string.IsNullOrWhiteSpace(text);
+        }
+
+        /// <summary>メニューから選んだフォルダ（「フォルダを開く…」「最近使ったフォルダ」）を、新しいウィンドウの
+        /// フォルダビューに開く。このウィンドウのフォルダビューで既に開いているフォルダなら、新しいウィンドウは
+        /// 開かず、フォルダビューを表示するだけにする。</summary>
+        /// <param name="a_folderPath">開くフォルダ。</param>
+        private void OpenFolderFromMenu(string a_folderPath)
+        {
+            AddToRecentFolders(a_folderPath);
+            if (IsSameFolder(a_folderPath, m_folderTreeManager.LoadedFolderRootPath))
+            {
+                ShowFolderPane();
+                return;
+            }
+            var newWindow = new MainWindow(this);
+            newWindow.Show();
+            newWindow.OpenFolderAsRoot(a_folderPath);
+        }
+
+        /// <summary>このウィンドウのフォルダビューに、指定したフォルダを開き、直下の最初のファイルを開く
+        /// （新しいウィンドウで「フォルダを開く…」「最近使ったフォルダ」を実行した時。起動時引数でフォルダを
+        /// 指定された時と同じ）。</summary>
+        /// <param name="a_folderPath">開くフォルダ。</param>
+        private void OpenFolderAsRoot(string a_folderPath)
+        {
+            m_folderTreeManager.LoadFolderTree(a_folderPath);
+            m_folderTreeManager.OpenFirstFileInLoadedFolder();
+            AddToRecentFolders(a_folderPath);
+            ShowFolderPane();
+        }
+
+        /// <summary>2つのフォルダのパスが同じフォルダを指すか（末尾の「\」の有無・大文字小文字は区別しない）。</summary>
+        /// <param name="a_a">フォルダのパス。</param>
+        /// <param name="a_b">フォルダのパス（nullなら常にfalse）。</param>
+        /// <returns>同じフォルダならtrue。</returns>
+        private static bool IsSameFolder(string a_a, string a_b)
+        {
+            if (string.IsNullOrEmpty(a_a) || string.IsNullOrEmpty(a_b))
+            {
+                return false;
+            }
+            try
+            {
+                return string.Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(a_a)),
+                    Path.TrimEndingDirectorySeparator(Path.GetFullPath(a_b)), StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>フォルダを選ぶダイアログを表示して、選んだフォルダをフォルダビューに開き、
+        /// 「最近使ったフォルダ」に加える。フォルダビューを隠していた場合は表示する。</summary>
+        private void ChooseAndOpenFolder()
+        {
+            string folder = m_folderTreeManager.ChooseAndOpenFolder();
+            if (null != folder)
+            {
+                AddToRecentFolders(folder);
+                ShowFolderPane();
+            }
+        }
+
+        /// <summary>フォルダビューを隠していれば表示する（「フォルダを表示」ボタンと同じ処理）。</summary>
+        private void ShowFolderPane()
+        {
+            if (!m_folderPaneVisibleFlg)
+            {
+                ToggleFolderPaneBtnClick(this, new RoutedEventArgs());
+            }
+        }
+
+        /// <summary>「最近使ったフォルダ」の一覧の先頭に、指定したフォルダを加える（既に一覧に
+        /// あれば先頭へ移す）。件数がMAX_RECENT_FOLDERSを超えたら、古いものから切り捨てる。</summary>
+        /// <param name="a_folderPath">開いたフォルダ。</param>
+        private void AddToRecentFolders(string a_folderPath)
+        {
+            if (string.IsNullOrEmpty(a_folderPath))
+            {
+                return;
+            }
+            string folder;
+            try
+            {
+                // 末尾の「\」の有無で別のフォルダとして並ばないようにそろえる（「C:\」等のルートはそのまま）
+                folder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(a_folderPath));
+            }
+            catch
+            {
+                folder = a_folderPath;
+            }
+            m_recentFolders.RemoveAll(p => string.Equals(p, folder, StringComparison.OrdinalIgnoreCase));
+            m_recentFolders.Insert(0, folder);
+            if (m_recentFolders.Count > MAX_RECENT_FOLDERS)
+            {
+                m_recentFolders.RemoveRange(MAX_RECENT_FOLDERS, m_recentFolders.Count - MAX_RECENT_FOLDERS);
+            }
+            RebuildRecentFoldersMenu();
+        }
+
+        /// <summary>「最近使ったフォルダ」サブメニューの中身を、現在のm_recentFoldersの内容から
+        /// 組み立て直す。フォルダ名だけでは区別しにくいため、フルパスで表示する。</summary>
+        private void RebuildRecentFoldersMenu()
+        {
+            m_recentFoldersMenu.Items.Clear();
+            if (0 == m_recentFolders.Count)
+            {
+                m_recentFoldersMenu.Items.Add(new MenuItem { Header = "（履歴なし）", IsEnabled = false });
+                return;
+            }
+            foreach (string path in m_recentFolders)
+            {
+                var item = new MenuItem
+                {
+                    // 「_」はメニューのアクセスキーの印として扱われて消えてしまうため、「__」にして
+                    // そのまま表示させる
+                    Header = path.Replace("_", "__"),
+                    ToolTip = path,
+                    Tag = path
+                };
+                item.Click += RecentFolderMenuItemClick;
+                m_recentFoldersMenu.Items.Add(item);
+            }
+            m_recentFoldersMenu.Items.Add(new Separator());
+            var clearItem = new MenuItem { Header = "履歴をクリア(_C)" };
+            clearItem.Click += (a_s, a_e) =>
+            {
+                m_recentFolders.Clear();
+                RebuildRecentFoldersMenu();
+            };
+            m_recentFoldersMenu.Items.Add(clearItem);
+        }
+
+        /// <summary>「最近使ったフォルダ」の項目をクリックした時、そのフォルダをフォルダビューに開く。
+        /// フォルダが見つからない（移動・削除済みなど）場合は、その旨を伝えて一覧からも外す。</summary>
+        /// <param name="a_sender">クリックされたメニュー項目（Tagにフォルダの絶対パスを持つ）。</param>
+        /// <param name="a_args">イベントの引数。</param>
+        private void RecentFolderMenuItemClick(object a_sender, RoutedEventArgs a_args)
+        {
+            string path = (string)((MenuItem)a_sender).Tag;
+            if (!Directory.Exists(path))
+            {
+                MessageBox.Show("フォルダが見つかりませんでした：" + path, "最近使ったフォルダ",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                m_recentFolders.Remove(path);
+                RebuildRecentFoldersMenu();
+                return;
+            }
+            if (OpensInNewWindow())
+            {
+                OpenFolderFromMenu(path);
+                return;
+            }
+            if (m_folderTreeManager.OpenFolder(path))
+            {
+                AddToRecentFolders(path);
+                ShowFolderPane();
+            }
+        }
+
+        private void TreeViewItemExpanded(object a_sender, RoutedEventArgs a_args) => m_folderTreeManager.HandleTreeViewItemExpanded(a_sender, a_args);
+
+        private void FolderTreeLoaded(object a_sender, RoutedEventArgs a_args) => m_folderTreeManager.HandleFolderTreeLoaded(a_sender, a_args);
+
+        private void FolderTreeSelectedItemChanged(object a_sender, RoutedPropertyChangedEventArgs<object> a_args) => m_folderTreeManager.HandleSelectedItemChanged(a_sender, a_args);
+
+        private void FolderTreeItemRequestBringIntoView(object a_sender, RequestBringIntoViewEventArgs a_args) => m_folderTreeManager.HandleFolderTreeItemRequestBringIntoView(a_sender, a_args);
+
+        /// <summary>指定した型の子孫要素をビジュアルツリーから探す。エディタペインのスクロール
+        /// 位置保持処理（ScrollEditorToTop等、区画外・MainWindow側に残っている）から使われて
+        /// いるため、こちらはMainWindow側に残している（FolderTreeManager/OutlineManagerは
+        /// それぞれ自分専用のTreeView向けに、依存関係のない小さな自己完結のコピーを持つ）。</summary>
+        private static T FindVisualChild<T>(DependencyObject a_root) where T : DependencyObject
+        {
+            for (int i = 0; i < VisualTreeHelper.GetChildrenCount(a_root); i++)
+            {
+                var child = VisualTreeHelper.GetChild(a_root, i);
+                if (child is T match)
+                {
+                    return match;
+                }
+                var found = FindVisualChild<T>(child);
+                if (null != found)
+                {
+                    return found;
+                }
+            }
+            return null;
+        }
+
+        // ======================================================================
+        //  アウトラインペイン
+        // ======================================================================
+        //
+        // アウトラインのTreeView自体に関わる処理はOutlineManagerが担う（フォルダペインと
+        // 同じ考え方）。ここもXAMLバインディング用の薄いラッパーだけを残している。
+
+        private void OutlineTreeLoaded(object a_sender, RoutedEventArgs a_args) => m_outlineManager.HandleOutlineTreeLoaded(a_sender, a_args);
+
+        private void OutlineTreeSelectedItemChanged(object a_sender, RoutedPropertyChangedEventArgs<object> a_args) => m_outlineManager.HandleSelectionChanged(a_sender, a_args);
+
+        private void OutlineTreeItemRequestBringIntoView(object a_sender, RequestBringIntoViewEventArgs a_args) => m_outlineManager.HandleOutlineTreeItemRequestBringIntoView(a_sender, a_args);
+    }
+}
